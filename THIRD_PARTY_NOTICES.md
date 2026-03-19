@@ -1,6 +1,14 @@
+# Third-Party Notices
+
+## modded-nanogpt
+
+Parts of this repository were adapted from [KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt), which is licensed under the MIT License.
+
+Original source: https://github.com/KellerJordan/modded-nanogpt
+
 MIT License
 
-Copyright (c) 2026 OpenAI
+Copyright (c) 2024 Keller Jordan
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
