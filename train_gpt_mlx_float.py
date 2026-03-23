@@ -165,8 +165,7 @@ def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
 
 
 def zeropower_newtonschulz5(g: mx.array, steps: int, eps: float = 1e-7) -> mx.array:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
+    # NorMuon: normalize by RMS instead of spectral norm for more stable updates.
     # Background on Muon: https://kellerjordan.github.io/posts/muon/
     a, b, c = 3.4445, -4.7750, 2.0315
     x = g.astype(mx.float32)
