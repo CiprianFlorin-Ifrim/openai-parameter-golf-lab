@@ -4,6 +4,10 @@
 
 Submission for the [OpenAI Parameter Golf Challenge](https://github.com/openai/parameter-golf): train the best language model that fits in a **16MB artifact** and trains in **under 10 minutes on 8xH100 SXM GPUs**, evaluated by bits-per-byte (BPB) on the FineWeb validation set.
 
+This repo uses work previously done (July 2024 - September 2025) on the **SPARROW/SPARROW-Next & AURI MLM (Microcontroller Language Model/Micro Language Model - Private Research)** together with the [Ternary Transformer Lab Personal Repository](https://github.com/CiprianFlorin-Ifrim/ternary-transformer-lab) and [Transformer Tversky Prototypes Lab](https://github.com/CiprianFlorin-Ifrim/transformer-tversky-prototypes-lab). 
+
+The purpose was to not only have a very large model (parameter wise) that can be trained well in 10 minutes, but with _infinite compute_ is SOTA, while consuming extremely little space, RAM and with custom kernel, processing power, **inspired by the BitNet 1-bit and 1.58-bit models from Microsoft**. 
+
 ---
 
 ## Results
