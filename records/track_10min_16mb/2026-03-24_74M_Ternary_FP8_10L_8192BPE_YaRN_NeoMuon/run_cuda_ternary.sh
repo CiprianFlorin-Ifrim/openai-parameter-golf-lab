@@ -1,4 +1,4 @@
-RUN_ID=ternary_run \
+RUN_ID=pushing_run_ternary_4 \
 DATA_PATH=./data/datasets/fineweb10B_sp8192 \
 TOKENIZER_PATH=./data/tokenizers/fineweb_8192_bpe.model \
 ATTN_PROJ_TYPE=standard \
