@@ -1,4 +1,4 @@
-# Parameter Golf — Brainquiver
+# Parameter Golf - OpenAI Challenge
 
 **Author:** Ciprian-Florin Ifrim | **Date:** March 2026
 
