@@ -1,10 +1,12 @@
 # Record: 1.1570 BPB — 73.7M Ternary U-Net Transformer
 
-**BitNet b1.58 + NeoMuon + 4x relu² MLP + Factored Tied Embedding + Poly5 Softcap + YaRN 2048 + 8192 BPE + FP8 QAT + Base-3 LZMA + Stride-16 Sliding Eval**
+**BitNet b1.58 + 10L + NeoMuon + 4x relu² MLP + Factored Tied Embedding + Poly5 Softcap + YaRN 2048 + 8192 BPE + FP8 QAT + Base-3 LZMA + Stride-16 Sliding Eval**
 
 **val_bpb: 1.1570** (3-seed mean sliding, std 0.0007) | **15.99 MB** max artifact | 8×H100 SXM, 599s
 
 > **Full experiment log covering 250+ runs, ablations, and decision rationale, that could help anyone else: [RESULTS.md](RESULTS.md). Complete training logs in my personal repo: [logs/](https://github.com/CiprianFlorin-Ifrim/openai-parameter-golf-submission/tree/main/logs/cuda).**
+
+The results document linked here and in my repo showcases all methods and sweeps applied to both Binary and Ternary Bitnets, which unfortunately are incompatible with many methods, such as Tversky Layers, EMA, Muon WD, LM Logit Head ranking and many more. Scaling ratios and applicable/rejected techniques can be useful for other submissions too.
 
 ## Results (3 seeds, 8×H100 SXM)
 
