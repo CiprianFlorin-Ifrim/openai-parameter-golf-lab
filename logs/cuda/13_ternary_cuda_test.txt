@@ -1,0 +1,20 @@
+model_params:17059912 layers:9 dim:512 heads:8 kv_heads:4
+ternary:True threshold_start:0.05 threshold_end:0.05 warmup:0
+train_batch_tokens:524288 seq_len:1024 iterations:20
+world_size:1 grad_accum_steps:8
+warmup_step:1/2
+warmup_step:2/2
+model_params:17059912 layers:9 dim:512 heads:8 kv_heads:4
+ternary:True threshold_start:0.05 threshold_end:0.05 warmup:0
+train_batch_tokens:524288 seq_len:1024 iterations:20
+world_size:1 grad_accum_steps:8
+warmup_step:1/2
+warmup_step:2/2
+step:0/20 val_loss:6.9357 val_bpb:4.1077 train_time:0ms zero_frac:1.000 mean_abs:0.0000 threshold:0.0500 churn:0.0000
+step:10/20 train_loss:5.4563 train_time:7575ms step_avg:757.49ms
+step:20/20 train_loss:5.3590 train_time:15148ms step_avg:757.39ms
+step:20/20 val_loss:5.3803 val_bpb:3.1865 train_time:15148ms zero_frac:1.000 mean_abs:0.0000 threshold:0.0500 churn:0.0000
+serialized_model_int8_zlib:5075196 bytes (payload_ratio:3.91x)
+code_bytes:38641 total_submission:5113837
+final_int8_zlib_roundtrip val_loss:5.3923 val_bpb:3.1936
+final_int8_zlib_roundtrip_exact val_loss:5.39232892 val_bpb:3.19364092

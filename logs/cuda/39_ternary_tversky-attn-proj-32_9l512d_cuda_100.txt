@@ -1,0 +1,31 @@
+model_params:22057059 layers:9 dim:512 heads:8 kv_heads:4
+vocab_size:8192 tie_embeddings:True embed_dim:128
+activation:relu mlp_mult:2 mtp_heads:0
+bitnet:True group_size:64 ternary_threshold_warmup:0
+attn_proj_type:tversky logit_head_type:standard tversky_num_features:32
+logit_softcap:30.0 qk_gain_init:1.5 rope_base:10000.0
+matrix_lr:0.04 scalar_lr:0.04 tied_embed_lr:0.05 head_lr:0.008
+muon_momentum:0.95 muon_backend_steps:5
+muon_warmup_start:0.85 muon_warmup_steps:10
+beta1:0.9 beta2:0.95 adam_eps:1e-08 grad_clip:0.0
+train_batch_tokens:524288 seq_len:1024 iterations:100
+warmup_steps:2 warmdown_iters:20 max_wallclock:0.0
+untie_at_fraction:0.0 sliding_eval:False
+world_size:1 grad_accum_steps:8 seed:1337
+data_path:./data/datasets/fineweb10B_sp8192 tokenizer:./data/tokenizers/fineweb_8192_bpe.model
+warmup_step:1/2
+warmup_step:2/2
+step:0/100 val_loss:9.0119 val_bpb:3.5292 train_time:0ms zero_frac:0.167 churn:0.0000
+step:25/100 train_loss:5.6508 train_time:18728ms step_avg:749.10ms
+step:50/100 train_loss:5.4141 train_time:37537ms step_avg:750.75ms
+step:75/100 train_loss:5.2792 train_time:56401ms step_avg:752.02ms
+step:100/100 train_loss:5.1382 train_time:75334ms step_avg:753.34ms
+step:100/100 val_loss:5.0670 val_bpb:1.9843 train_time:75334ms zero_frac:0.132 churn:0.7665
+ternary_artifact:5568684 bytes (lzma) = 5.57MB
+  lzma: 5568684 bytes = 5.57MB
+  zlib: 6296984 bytes = 6.30MB
+  ternary_params:16515072 (3819132 bytes)
+  fp16_params:5541987 (11083974 bytes)
+code_bytes:60140 total_submission:5628824 (5.63MB)
+int8_zlib_artifact:12626765 bytes = 12.63MB (for comparison)
+final_ternary_roundtrip val_loss:5.1410 val_bpb:2.0133

@@ -1,0 +1,40 @@
+model_params:38031432 layers:9 dim:512 heads:8 kv_heads:4
+bitnet:True group_size:64 ternary_threshold_warmup:0
+train_batch_tokens:524288 seq_len:1024 iterations:100
+world_size:1 grad_accum_steps:8
+warmup_step:1/2
+warmup_step:2/2
+step:0/100 val_loss:9.0082 val_bpb:3.5277 train_time:0ms zero_frac:0.149 churn:0.0000
+step:25/100 train_loss:7.2555 train_time:27582ms step_avg:1103.27ms
+step:50/100 train_loss:6.4248 train_time:55353ms step_avg:1107.06ms
+step:75/100 train_loss:6.2064 train_time:83222ms step_avg:1109.62ms
+step:100/100 train_loss:6.0083 train_time:111122ms step_avg:1111.22ms
+step:100/100 val_loss:5.0303 val_bpb:1.9699 train_time:111122ms zero_frac:0.133 churn:0.8086
+ternary_artifact:10692340 bytes (lzma) = 10.69MB
+  lzma: 10692340 bytes = 10.69MB
+  zlib: 11935670 bytes = 11.94MB
+  ternary_params:21233664 (4910310 bytes)
+  fp16_params:8409160 (16818320 bytes)
+code_bytes:50782 total_submission:10743122 (10.74MB)
+int8_zlib_artifact:19197529 bytes = 19.20MB (for comparison)
+model_params:38031432 layers:9 dim:512 heads:8 kv_heads:4
+bitnet:True group_size:64 ternary_threshold_warmup:0
+train_batch_tokens:524288 seq_len:1024 iterations:100
+world_size:1 grad_accum_steps:8
+warmup_step:1/2
+warmup_step:2/2
+step:0/100 val_loss:9.0082 val_bpb:3.5277 train_time:0ms zero_frac:0.149 churn:0.0000
+step:25/100 train_loss:7.1360 train_time:27556ms step_avg:1102.23ms
+step:50/100 train_loss:6.4137 train_time:55326ms step_avg:1106.52ms
+step:75/100 train_loss:6.1946 train_time:83197ms step_avg:1109.29ms
+step:100/100 train_loss:5.9899 train_time:111101ms step_avg:1111.01ms
+step:100/100 val_loss:5.0118 val_bpb:1.9627 train_time:111101ms zero_frac:0.133 churn:0.8086
+ternary_artifact:10688340 bytes (lzma) = 10.69MB
+  lzma: 10688340 bytes = 10.69MB
+  zlib: 11931474 bytes = 11.93MB
+  ternary_params:21233664 (4910310 bytes)
+  fp16_params:8409160 (16818320 bytes)
+code_bytes:50783 total_submission:10739123 (10.74MB)
+int8_zlib_artifact:19178358 bytes = 19.18MB (for comparison)
+final_ternary_roundtrip val_loss:5.0234 val_bpb:1.9672
+final_ternary_roundtrip_exact val_loss:5.02338762 val_bpb:1.96721615

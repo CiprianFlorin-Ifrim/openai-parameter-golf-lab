@@ -1,0 +1,21 @@
+model_params:29642824 layers:9 dim:512 heads:8 kv_heads:4
+bitnet:True group_size:64 ternary_threshold_warmup:0
+train_batch_tokens:524288 seq_len:1024 iterations:100
+world_size:1 grad_accum_steps:8
+warmup_step:1/2
+warmup_step:2/2
+step:0/100 val_loss:9.0078 val_bpb:3.5275 train_time:0ms zero_frac:0.191 churn:0.0000
+step:25/100 train_loss:6.3699 train_time:23808ms step_avg:952.31ms
+step:50/100 train_loss:5.5604 train_time:47755ms step_avg:955.10ms
+step:75/100 train_loss:5.3122 train_time:71840ms step_avg:957.86ms
+step:100/100 train_loss:5.1067 train_time:95968ms step_avg:959.68ms
+step:100/100 val_loss:5.0315 val_bpb:1.9704 train_time:95968ms zero_frac:0.172 churn:0.7553
+ternary_artifact:10702740 bytes (lzma) = 10.70MB
+  lzma: 10702740 bytes = 10.70MB
+  zlib: 11937859 bytes = 11.94MB
+  ternary_params:21233664 (4910310 bytes)
+  fp16_params:8409160 (16818320 bytes)
+code_bytes:49728 total_submission:10752468 (10.75MB)
+int8_zlib_artifact:19202327 bytes = 19.20MB (for comparison)
+final_ternary_roundtrip val_loss:5.0414 val_bpb:1.9743
+final_ternary_roundtrip_exact val_loss:5.04141579 val_bpb:1.97427619

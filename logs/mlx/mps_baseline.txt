@@ -1,0 +1,124 @@
+Running Python 3.11.15 (main, Mar 11 2026, 17:14:47) [Clang 20.1.8 ]
+Running PyTorch 2.10.0
+Device: mps
+val_tokens:62021632
+model_params:17059912 vocab_size:1024 layers:9 dim:512 heads:8 kv_heads:4
+train_batch_tokens:8192 train_seq_len:512 iterations:20 warmup_steps:5 max_wallclock_seconds:600.0
+warmup_step:1/5
+warmup_step:2/5
+warmup_step:3/5
+warmup_step:4/5
+warmup_step:5/5
+Running Python 3.11.15 (main, Mar 11 2026, 17:14:47) [Clang 20.1.8 ]
+Running PyTorch 2.10.0
+Device: mps
+val_tokens:62021632
+model_params:17059912 vocab_size:1024 layers:9 dim:512 heads:8 kv_heads:4
+train_batch_tokens:8192 train_seq_len:512 iterations:20 warmup_steps:5 max_wallclock_seconds:600.0
+warmup_step:1/5
+warmup_step:2/5
+warmup_step:3/5
+warmup_step:4/5
+warmup_step:5/5
+Running Python 3.11.15 (main, Mar 11 2026, 17:14:47) [Clang 20.1.8 ]
+Running PyTorch 2.10.0
+Device: mps
+val_tokens:62021632
+model_params:17059912 vocab_size:1024 layers:9 dim:512 heads:8 kv_heads:4
+train_batch_tokens:8192 train_seq_len:512 iterations:20 warmup_steps:5 max_wallclock_seconds:600.0
+warmup_step:1/5
+warmup_step:2/5
+warmup_step:3/5
+warmup_step:4/5
+warmup_step:5/5
+step:1/20 train_loss:6.9447 train_time:650ms step_avg:649.70ms
+step:2/20 train_loss:18.8360 train_time:1335ms step_avg:667.38ms
+step:3/20 train_loss:15.0773 train_time:2022ms step_avg:673.89ms
+step:4/20 train_loss:11.1343 train_time:2709ms step_avg:677.23ms
+step:5/20 train_loss:8.3698 train_time:3397ms step_avg:679.37ms
+step:6/20 train_loss:7.0901 train_time:4084ms step_avg:680.65ms
+step:7/20 train_loss:6.6963 train_time:4771ms step_avg:681.57ms
+step:8/20 train_loss:6.6571 train_time:5459ms step_avg:682.34ms
+step:9/20 train_loss:6.4703 train_time:6146ms step_avg:682.87ms
+step:10/20 train_loss:6.3762 train_time:6833ms step_avg:683.30ms
+step:11/20 train_loss:6.2435 train_time:7521ms step_avg:683.70ms
+step:12/20 train_loss:6.1917 train_time:8208ms step_avg:684.01ms
+step:13/20 train_loss:6.0627 train_time:8896ms step_avg:684.28ms
+step:14/20 train_loss:6.1740 train_time:9583ms step_avg:684.53ms
+step:15/20 train_loss:6.0993 train_time:10271ms step_avg:684.70ms
+step:16/20 train_loss:5.9408 train_time:10958ms step_avg:684.87ms
+step:17/20 train_loss:5.7174 train_time:11645ms step_avg:685.02ms
+step:18/20 train_loss:5.8897 train_time:12332ms step_avg:685.13ms
+step:19/20 train_loss:5.7619 train_time:13020ms step_avg:685.25ms
+step:20/20 train_loss:5.7947 train_time:13708ms step_avg:685.39ms
+Running Python 3.11.15 (main, Mar 11 2026, 17:14:47) [Clang 20.1.8 ]
+Running PyTorch 2.10.0
+Device: mps
+val_tokens:499712
+model_params:17059912 vocab_size:1024 layers:9 dim:512 heads:8 kv_heads:4
+train_batch_tokens:8192 train_seq_len:512 iterations:10 warmup_steps:5 max_wallclock_seconds:600.0
+warmup_step:1/5
+warmup_step:2/5
+warmup_step:3/5
+warmup_step:4/5
+warmup_step:5/5
+step:0/10 val_loss:6.9355 val_bpb:4.1751 train_time:0ms step_avg:0.00ms
+step:1/10 train_loss:6.9447 train_time:647ms step_avg:647.04ms
+step:2/10 train_loss:18.8360 train_time:1334ms step_avg:667.00ms
+step:3/10 train_loss:15.0684 train_time:2020ms step_avg:673.32ms
+step:4/10 train_loss:11.1281 train_time:2706ms step_avg:676.49ms
+step:5/10 train_loss:8.3648 train_time:3393ms step_avg:678.52ms
+step:6/10 train_loss:7.0889 train_time:4079ms step_avg:679.86ms
+step:7/10 train_loss:6.6970 train_time:4766ms step_avg:680.80ms
+step:8/10 train_loss:6.6559 train_time:5452ms step_avg:681.50ms
+step:9/10 train_loss:6.4693 train_time:6153ms step_avg:683.66ms
+step:10/10 train_loss:6.3765 train_time:6827ms step_avg:682.73ms
+step:10/10 val_loss:6.2722 val_bpb:3.7758 train_time:6827ms step_avg:682.75ms
+Serialized model: 68272279 bytes
+Code size: 33364 bytes
+Total submission size (raw): 68305643 bytes
+Serialized model int8+zlib: 7173563 bytes (payload_ratio:3.97x)
+Total submission size int8+zlib: 7206927 bytes
+final_int8_zlib_roundtrip val_loss:6.2728 val_bpb:3.7761
+final_int8_zlib_roundtrip_exact val_loss:6.27281094 val_bpb:3.77614863
+Running Python 3.11.15 (main, Mar 11 2026, 17:14:47) [Clang 20.1.8 ]
+Running PyTorch 2.10.0
+Device: mps
+val_tokens:62021632
+model_params:17059912 vocab_size:1024 layers:9 dim:512 heads:8 kv_heads:4
+train_batch_tokens:8192 train_seq_len:512 iterations:10 warmup_steps:5 max_wallclock_seconds:600.0
+warmup_step:1/5
+warmup_step:2/5
+warmup_step:3/5
+warmup_step:4/5
+warmup_step:5/5
+Running Python 3.11.15 (main, Mar 11 2026, 17:14:47) [Clang 20.1.8 ]
+Running PyTorch 2.10.0
+Device: mps
+val_tokens:499712
+model_params:17059912 vocab_size:1024 layers:9 dim:512 heads:8 kv_heads:4
+train_batch_tokens:8192 train_seq_len:512 iterations:10 warmup_steps:5 max_wallclock_seconds:600.0
+warmup_step:1/5
+warmup_step:2/5
+warmup_step:3/5
+warmup_step:4/5
+warmup_step:5/5
+step:0/10 val_loss:6.9355 val_bpb:4.1751 train_time:0ms step_avg:0.00ms
+step:1/10 train_loss:6.9447 train_time:650ms step_avg:649.85ms
+step:2/10 train_loss:18.8360 train_time:1336ms step_avg:668.20ms
+step:3/10 train_loss:15.0780 train_time:2025ms step_avg:674.86ms
+step:4/10 train_loss:11.1373 train_time:2716ms step_avg:679.02ms
+step:5/10 train_loss:8.3729 train_time:3407ms step_avg:681.35ms
+step:6/10 train_loss:7.0902 train_time:4094ms step_avg:682.28ms
+step:7/10 train_loss:6.6946 train_time:4781ms step_avg:682.96ms
+step:8/10 train_loss:6.6556 train_time:5469ms step_avg:683.57ms
+step:9/10 train_loss:6.4690 train_time:6160ms step_avg:684.44ms
+step:10/10 train_loss:6.3751 train_time:6851ms step_avg:685.14ms
+step:10/10 val_loss:6.2721 val_bpb:3.7757 train_time:6852ms step_avg:685.17ms
+Serialized model: 68272279 bytes
+Code size: 33364 bytes
+Total submission size (raw): 68305643 bytes
+Serialized model int8+zlib: 7163807 bytes (payload_ratio:3.97x)
+Total submission size int8+zlib: 7197171 bytes
+final_int8_zlib_roundtrip val_loss:6.2731 val_bpb:3.7763
+final_int8_zlib_roundtrip_exact val_loss:6.27307606 val_bpb:3.77630823

@@ -1,0 +1,61 @@
+model_params:32542848 layers:16 dim:512 heads:8 kv_heads:4
+bitnet:True group_size:64 ternary_threshold_warmup:0
+train_batch_tokens:524288 seq_len:1024 iterations:100
+world_size:1 grad_accum_steps:8
+model_params:32542848 layers:16 dim:512 heads:8 kv_heads:4
+bitnet:True group_size:64 ternary_threshold_warmup:0
+train_batch_tokens:524288 seq_len:1024 iterations:100
+world_size:1 grad_accum_steps:8
+model_params:32542848 layers:16 dim:512 heads:8 kv_heads:4
+bitnet:True group_size:64 ternary_threshold_warmup:0
+train_batch_tokens:524288 seq_len:1024 iterations:100
+world_size:1 grad_accum_steps:8
+model_params:32542848 layers:16 dim:512 heads:8 kv_heads:4
+bitnet:True group_size:64 ternary_threshold_warmup:0
+train_batch_tokens:524288 seq_len:1024 iterations:100
+world_size:1 grad_accum_steps:8
+model_params:32542848 layers:16 dim:512 heads:8 kv_heads:4
+bitnet:True group_size:64 ternary_threshold_warmup:0
+train_batch_tokens:524288 seq_len:1024 iterations:100
+world_size:1 grad_accum_steps:8
+model_params:32542848 layers:16 dim:512 heads:8 kv_heads:4
+bitnet:True group_size:64 ternary_threshold_warmup:0
+train_batch_tokens:524288 seq_len:1024 iterations:100
+world_size:1 grad_accum_steps:8
+model_params:32542848 layers:16 dim:512 heads:8 kv_heads:4
+bitnet:True group_size:64 ternary_threshold_warmup:0
+train_batch_tokens:524288 seq_len:1024 iterations:100
+world_size:1 grad_accum_steps:8
+model_params:32542848 layers:16 dim:512 heads:8 kv_heads:4
+bitnet:True group_size:64 ternary_threshold_warmup:0
+train_batch_tokens:524288 seq_len:1024 iterations:100
+world_size:1 grad_accum_steps:8
+model_params:32542848 layers:16 dim:512 heads:8 kv_heads:4
+bitnet:True group_size:64 ternary_threshold_warmup:0
+train_batch_tokens:524288 seq_len:1024 iterations:100
+world_size:1 grad_accum_steps:8
+model_params:32542848 layers:16 dim:512 heads:8 kv_heads:4
+bitnet:True group_size:64 ternary_threshold_warmup:0
+train_batch_tokens:524288 seq_len:1024 iterations:100
+world_size:1 grad_accum_steps:8
+model_params:32542848 layers:16 dim:512 heads:8 kv_heads:4
+bitnet:True group_size:64 ternary_threshold_warmup:0
+train_batch_tokens:262144 seq_len:1024 iterations:100
+world_size:1 grad_accum_steps:8
+warmup_step:1/2
+warmup_step:2/2
+step:0/100 val_loss:nan val_bpb:nan train_time:0ms zero_frac:0.184 churn:0.0000
+step:25/100 train_loss:nan train_time:38505ms step_avg:1540.21ms
+step:50/100 train_loss:nan train_time:77000ms step_avg:1540.00ms
+step:75/100 train_loss:nan train_time:115491ms step_avg:1539.87ms
+step:100/100 train_loss:nan train_time:154002ms step_avg:1540.02ms
+step:100/100 val_loss:nan val_bpb:nan train_time:154003ms zero_frac:0.000 churn:1.0000
+ternary_artifact:9844 bytes (lzma) = 0.01MB
+  lzma: 9844 bytes = 0.01MB
+  zlib: 31642 bytes = 0.03MB
+  ternary_params:31457280 (7274544 bytes)
+  fp16_params:1085568 (2171136 bytes)
+code_bytes:49898 total_submission:59742 (0.06MB)
+int8_zlib_artifact:51858 bytes = 0.05MB (for comparison)
+final_ternary_roundtrip val_loss:nan val_bpb:nan
+final_ternary_roundtrip_exact val_loss:nan val_bpb:nan

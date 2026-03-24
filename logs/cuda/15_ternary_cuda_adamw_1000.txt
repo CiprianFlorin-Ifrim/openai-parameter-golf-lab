@@ -1,0 +1,38 @@
+model_params:29921408 layers:16 dim:512 heads:8 kv_heads:4
+ternary:True threshold_start:0.05 threshold_end:0.05 warmup:0
+train_batch_tokens:524288 seq_len:1024 iterations:1000
+world_size:1 grad_accum_steps:8
+warmup_step:1/5
+warmup_step:2/5
+warmup_step:3/5
+warmup_step:4/5
+warmup_step:5/5
+step:0/1000 val_loss:6.9365 val_bpb:4.1082 train_time:0ms zero_frac:1.000 mean_abs:0.0000 threshold:0.0500 churn:0.0000
+step:50/1000 train_loss:5.2476 train_time:64345ms step_avg:1286.90ms
+step:100/1000 train_loss:5.0068 train_time:128874ms step_avg:1288.74ms
+step:150/1000 train_loss:4.9492 train_time:193405ms step_avg:1289.36ms
+step:200/1000 train_loss:4.7194 train_time:257938ms step_avg:1289.69ms
+step:250/1000 train_loss:4.6749 train_time:322473ms step_avg:1289.89ms
+step:250/1000 val_loss:4.6970 val_bpb:2.7818 train_time:322556ms zero_frac:0.984 mean_abs:0.0000 threshold:0.0500 churn:0.0161
+step:300/1000 train_loss:4.6574 train_time:386948ms step_avg:1289.83ms
+step:350/1000 train_loss:4.6430 train_time:451484ms step_avg:1289.95ms
+step:400/1000 train_loss:4.6733 train_time:516022ms step_avg:1290.05ms
+step:450/1000 train_loss:4.6729 train_time:580566ms step_avg:1290.15ms
+step:500/1000 train_loss:4.6528 train_time:645104ms step_avg:1290.21ms
+step:500/1000 val_loss:4.6399 val_bpb:2.7480 train_time:645187ms zero_frac:0.983 mean_abs:0.0000 threshold:0.0500 churn:0.0043
+step:550/1000 train_loss:4.6318 train_time:709612ms step_avg:1290.20ms
+step:600/1000 train_loss:4.6561 train_time:774143ms step_avg:1290.24ms
+step:650/1000 train_loss:4.6353 train_time:838673ms step_avg:1290.27ms
+step:700/1000 train_loss:4.6549 train_time:903212ms step_avg:1290.30ms
+step:750/1000 train_loss:4.6287 train_time:967754ms step_avg:1290.34ms
+step:750/1000 val_loss:4.6319 val_bpb:2.7433 train_time:967837ms zero_frac:0.983 mean_abs:0.0000 threshold:0.0500 churn:0.0020
+step:800/1000 train_loss:4.5944 train_time:1032295ms step_avg:1290.37ms
+step:850/1000 train_loss:4.6063 train_time:1096834ms step_avg:1290.39ms
+step:900/1000 train_loss:4.5833 train_time:1161377ms step_avg:1290.42ms
+step:950/1000 train_loss:4.6158 train_time:1225909ms step_avg:1290.43ms
+step:1000/1000 train_loss:4.6574 train_time:1290440ms step_avg:1290.44ms
+step:1000/1000 val_loss:4.5993 val_bpb:2.7240 train_time:1290523ms zero_frac:0.983 mean_abs:0.0000 threshold:0.0500 churn:0.0011
+serialized_model_int8_zlib:8808864 bytes (payload_ratio:3.94x)
+code_bytes:38321 total_submission:8847185
+final_int8_zlib_roundtrip val_loss:4.6007 val_bpb:2.7248
+final_int8_zlib_roundtrip_exact val_loss:4.60073285 val_bpb:2.72481314
