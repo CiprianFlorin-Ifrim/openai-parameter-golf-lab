@@ -105,6 +105,8 @@ class Hyperparameters:
     temp_scaling = _e("TEMP_SCALING", 0, bool)
     _fp_raw = os.environ.get("FP_STORAGE", "0")
     fp_storage = True if _fp_raw == "FP8" else ("fp4" if _fp_raw == "FP4" else False)
+    checkpoint_every = _e("CHECKPOINT_EVERY", 0, int)   # 0 = disabled
+    checkpoint_dir = _e("CHECKPOINT_DIR", "./checkpoints")
 
 CTP = ("attn_scale","attn_scales","mlp_scale","mlp_scales","resid_mix","resid_mixes","q_gain","diff_lambda","skip_weight","skip_weights","vocab_bias","refiner.gate")
 
@@ -1054,6 +1056,52 @@ def find_temp(args, base_model, rank, world_size, device, grad_accum_steps,
     return best_t
 
 # ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+def _ckpt_path(checkpoint_dir: str, step: int) -> str:
+    return os.path.join(checkpoint_dir, f"ckpt_step{step:07d}.pt")
+
+def _latest_checkpoint(checkpoint_dir: str) -> str | None:
+    if not os.path.isdir(checkpoint_dir):
+        return None
+    ckpts = sorted(glob.glob(os.path.join(checkpoint_dir, "ckpt_step*.pt")))
+    return ckpts[-1] if ckpts else None
+
+def save_checkpoint(checkpoint_dir: str, step: int, base_model: nn.Module,
+                    optimizers: list, training_time_ms: float,
+                    _untied: bool, _seq_switched: bool, _batch_switched: bool) -> None:
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    path = _ckpt_path(checkpoint_dir, step)
+    payload = {
+        "step": step,
+        "training_time_ms": training_time_ms,
+        "model": base_model.state_dict(),
+        "optimizers": [o.state_dict() for o in optimizers],
+        "rng_cpu": torch.get_rng_state(),
+        "rng_cuda": torch.cuda.get_rng_state(),
+        "flags": {"_untied": _untied, "_seq_switched": _seq_switched, "_batch_switched": _batch_switched},
+    }
+    tmp = path + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)   # atomic on POSIX
+
+def load_checkpoint(path: str, base_model: nn.Module, optimizers: list, device: torch.device):
+    payload = torch.load(path, map_location=device, weights_only=False)
+    base_model.load_state_dict(payload["model"], strict=True)
+    for opt, sd in zip(optimizers, payload["optimizers"]):
+        opt.load_state_dict(sd)
+    torch.set_rng_state(payload["rng_cpu"])
+    torch.cuda.set_rng_state(payload["rng_cuda"])
+    flags = payload.get("flags", {})
+    return (
+        payload["step"],
+        payload["training_time_ms"],
+        flags.get("_untied", False),
+        flags.get("_seq_switched", False),
+        flags.get("_batch_switched", False),
+    )
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -1182,6 +1230,24 @@ def main() -> None:
             betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True)
         optimizers.append(opt_corr)
 
+    # --- Checkpoint resume ---
+    _resume_step = 0
+    _resume_training_ms = 0.0
+    _resume_untied = False
+    _resume_seq_switched = False
+    _resume_batch_switched = False
+    if args.checkpoint_every > 0:
+        ckpt = _latest_checkpoint(args.checkpoint_dir)
+        if ckpt is not None:
+            log0(f"checkpoint found: {ckpt}")
+            (_resume_step, _resume_training_ms,
+             _resume_untied, _resume_seq_switched, _resume_batch_switched) = load_checkpoint(
+                ckpt, base_model, optimizers, device)
+            log0(f"checkpoint loaded, starting from step {_resume_step} "
+                 f"(accumulated_train_time:{_resume_training_ms:.0f}ms)")
+        else:
+            log0("no checkpoint found, starting from scratch")
+
     # --- Log all hyperparameters ---
     log0("--- Hyperparameters ---", console=False)
     log0(" ".join(f"{a}={getattr(args,a)}" for a in sorted(dir(args)) if not a.startswith("_") and a not in ("train_files","val_files") and not callable(getattr(args,a))), console=False)
@@ -1211,8 +1277,13 @@ def main() -> None:
     _batch_switched = False
     active_seq_len = args.seq_len_start if args.seq_len_start > 0 else args.train_seq_len
     active_batch_tokens = args.batch_tokens_start if args.batch_tokens_start > 0 else args.train_batch_tokens
-
-    # --- Compiler warmup ---
+    # If resuming after a schedule switch, apply the switched values immediately
+    if _resume_seq_switched:
+        _seq_switched = True
+        active_seq_len = args.train_seq_len
+    if _resume_batch_switched:
+        _batch_switched = True
+        active_batch_tokens = args.train_batch_tokens
     if args.warmup_steps > 0:
         _ms = {n: t.detach().cpu().clone() for n, t in base_model.state_dict().items()}
         _os = [copy.deepcopy(o.state_dict()) for o in optimizers]
@@ -1234,13 +1305,26 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # --- Main training loop ---
-    training_time_ms = 0.0
+    training_time_ms = _resume_training_ms   # accumulate across restarts
     stop_after_step: int | None = None
-    _untied = False
+    _untied = _resume_untied
+    _seq_switched = _resume_seq_switched
+    _batch_switched = _resume_batch_switched
     train_loss = torch.zeros((), device=device)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    step = 0
+    step = _resume_step
+    steps_this_session = 0
+
+    # Guard: budget already exhausted at resume time — skip straight to serialization
+    if max_wallclock_ms is None:
+        if step >= args.iterations:
+            log0(f"checkpoint step {step} >= iterations {args.iterations}, skipping training and saving model")
+            stop_after_step = step
+    else:
+        if training_time_ms >= max_wallclock_ms:
+            log0(f"checkpoint train_time {training_time_ms:.0f}ms >= wallclock cap {max_wallclock_ms:.0f}ms, skipping training and saving model")
+            stop_after_step = step
 
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
@@ -1339,10 +1423,18 @@ def main() -> None:
             opt.step()
         zero_grad_all()
         step += 1
+        steps_this_session += 1
         approx_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        
+
+        # Checkpoint save
+        if master_process and args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
+            save_checkpoint(args.checkpoint_dir, step, base_model, optimizers,
+                            approx_ms, _untied, _seq_switched, _batch_switched)
+            log0(f"step:{step} checkpoint saved to {_ckpt_path(args.checkpoint_dir, step)}")
+
         if args.train_log_every > 0 and step % args.train_log_every == 0:
-            log0(f"step:{step}/{args.iterations} loss:{train_loss.item():.4f} t:{approx_ms:.0f}ms avg:{approx_ms/step:.1f}ms")
+            session_ms = 1000.0 * (time.perf_counter() - t0)
+            log0(f"step:{step}/{args.iterations} loss:{train_loss.item():.4f} t:{approx_ms:.0f}ms step_avg:{session_ms/steps_this_session:.1f}ms")
         if args.churn_log_every > 0 and step % args.churn_log_every == 0:
             log0(f"step:{step} churn:{churn_fn(base_model, args.bitnet_group_size):.4f} zero:{tern_stats(base_model, args.bitnet_group_size)['zero_frac']:.3f}")
 

@@ -66,4 +66,6 @@ TEMP_SCALING=1 \
 FP_STORAGE=FP8 \
 SEED=42 \
 COMPILE_MODE=default \
+CHECKPOINT_EVERY=500 \
+CHECKPOINT_DIR=./checkpoints \
 OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 train_gpt_cuda_ternary.py
