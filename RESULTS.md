@@ -10,7 +10,7 @@
 Train the best language model that fits in a 16MB artifact and trains in under 10 minutes on 8×H100 SXM GPUs, evaluated by tokenizer-agnostic bits-per-byte (BPB) compression on the FineWeb validation set.
 
 - **Baseline:** 1.2244 bpb (9L 512d int8+zlib, 1k vocab)
-- **External SOTA:** 1.1770 bpb (competitor, 68M ternary params, relu² MLP)
+- **External SOTA:** 1.1194
 - **Our best (ternary, valid):** 1.1565 bpb sliding (P2, 10L 768d relu² 4×MLP fp8, EMBED_DIM=254, seed=42, 16.00MB)
 - **Our best (binary, unconstrained):** 1.1239 bpb sliding (15L 768d binary relu² 4×MLP fp8, 50k steps / ~2h compute, 15.67MB)
 - **Our best (quality, over budget):** 1.1771 bpb (F59, 12L 768d swiglu 3×MLP, 21.96MB)
