@@ -23,8 +23,11 @@ Ternary improves over baseline by **0.067 bpb** within the competition budget. T
 
 | Track | Config | Sliding BPB | Artifact | Params | Steps | Training Time |
 |-------|--------|-------------|----------|--------|-------|---------------|
-| **Binary** | 15L 768d relu² 4×MLP fp8 smear | **1.1239** | 15.60MB | 97.3M | 50,000 | 7,763s |
+| **Binary** | 15L 768d relu² 4×MLP fp8 smear | **1.1239** | 15.60MB | 106.2M | 50,000 | 7,763s |
 | Baseline | 9L 512d SP1024 int8+zlib | 1.1749 | 15.81MB | 17.1M | 500,000 | 14,400s |
+
+These have been accepted and added into the main openai/parameter-golf repo. Check last section.
+
 
 ---
 
@@ -306,6 +309,15 @@ The `research/` directory contains Jupyter notebooks used to isolate and underst
 - **microbenchmark.ipynb** — Standalone H100 kernel timing for STE, RoPE, softcap, and CE+Z-loss variants. Demonstrated that torch.compile fusion invalidates standalone microbenchmark conclusions.
 - **charcnn.ipynb** — ByteCNN embedding generator experiment. Showed embedding collapse from CNN inductive bias.
 - **asymmetric_tokenizer_test.ipynb** — 8k BPE input / 256-byte output tokenizer. Confirmed byte independence assumption is mathematically incorrect.
+
+
+
+## PRs
+### PR640
+<img width="907" height="431" alt="PR640" src="https://github.com/user-attachments/assets/0f89b8eb-c365-4a54-b18e-5cc37d4f8bfc" />
+
+### PR641
+<img width="983" height="606" alt="PR641" src="https://github.com/user-attachments/assets/e95d459e-2743-4289-b8b2-b40735e190de" />
 
 ---
 
