@@ -10,13 +10,21 @@ The purpose was to not only have a very large model (parameter wise) that can be
 
 ## Results
 
+### Records Leaderboard Results
+
 | Track | Config | Sliding BPB | Artifact | Params | Training Time |
 |-------|--------|-------------|----------|--------|---------------|
 | **Ternary** | 10L 768d relu² 4×MLP fp8 | **1.1570** (mean, 3 seeds) | 15.92MB | 73.7M | 599s |
-| **Binary** | 15L 768d relu² 4×MLP fp8 smear | **1.1239** | 15.60MB | 97.3M | 7,763s |
 | Baseline | 9L 512d int8+zlib | 1.2244 | 15.86MB | 17.1M | 600s |
 
-Ternary submission improves over baseline by **0.067 bpb** within the competition budget. Three-seed standard deviation: 0.0007 bpb.
+Ternary improves over baseline by **0.067 bpb** within the competition budget. Three-seed standard deviation: 0.0007 bpb.
+
+### Notable Leaderboard Results
+
+| Track | Config | Sliding BPB | Artifact | Params | Steps | Training Time |
+|-------|--------|-------------|----------|--------|-------|---------------|
+| **Binary** | 15L 768d relu² 4×MLP fp8 smear | **1.1239** | 15.60MB | 97.3M | 50,000 | 7,763s |
+| Baseline | 9L 512d SP1024 int8+zlib | 1.1749 | 15.81MB | 17.1M | 500,000 | 14,400s |
 
 ---
 
