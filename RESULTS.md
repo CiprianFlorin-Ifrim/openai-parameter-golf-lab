@@ -10,7 +10,7 @@
 Train the best language model that fits in a 16MB artifact and trains in under 10 minutes on 8×H100 SXM GPUs, evaluated by tokenizer-agnostic bits-per-byte (BPB) compression on the FineWeb validation set.
 
 - **Baseline:** 1.2244 bpb (9L 512d int8+zlib, 1k vocab)
-- **External SOTA:** 1.1194
+- **External SOTA:** 1.1194 (LeakyReLU(0.5)^2 + TTT + Parallel Muon)
 - **Our best (ternary, valid):** 1.1565 bpb sliding (P2, 10L 768d relu² 4×MLP fp8, EMBED_DIM=254, seed=42, 16.00MB)
 - **Our best (binary, unconstrained):** 1.1239 bpb sliding (15L 768d binary relu² 4×MLP fp8, 50k steps / ~2h compute, 15.67MB)
 - **Our best (quality, over budget):** 1.1771 bpb (F59, 12L 768d swiglu 3×MLP, 21.96MB)
@@ -32,7 +32,7 @@ The challenge is framed as L(N) optimisation — minimising loss given fixed par
 | F prefix (F1...) | Final runs — 600s on 8×H100, official submissions |
 | P prefix (P1...) | Pushed/submission runs — final config pushed to GitHub |
 
-Additionally, 20 early architecture iterations were performed on MLX (Mac Studio M1 Ultra, 32GB unified memory) and 2 on MPS (MacBook Pro M1 Pro, 32GB unified memory) for rapid prototyping before GPU scaling.
+Additionally, 20 early architecture iterations were performed on MLX (Mac Studio M1 Ultra, 32GB unified memory) and 2 on MPS (same device with M1 Pro, 32GB unified memory) for rapid prototyping before GPU scaling.
 
 > **Note:** This document covers ~85 named runs (F, S, R series). An additional ~165 dev runs (plain numbered 1–100, repeated sweeps, smoke tests) were conducted but are not individually listed. Key findings from those runs are incorporated into the sweep tables and decision rationale. Separate synthetic-data notebooks were used to isolate the behaviour of specific techniques (Tversky similarity, linear alternatives, grouped projections) before committing H100 compute.
 
@@ -43,8 +43,8 @@ Additionally, 20 early architecture iterations were performed on MLX (Mac Studio
 | System | Spec | Notes |
 |--------|------|-------|
 | Dev | RTX 5090 32GB, single GPU | Triton smem ceiling 101KB/SM; blocks value embeddings and some kernels |
-| Mac (MLX) | Mac Studio M1 Ultra 32GB | MLX early iteration, 20 runs |
-| Mac (MPS) | MacBook Pro M1 Pro 32GB | MPS early iteration, 2 runs |
+| Mac (MLX) | Mac Studio M1 Pro 32GB | MLX early iteration, 20 runs |
+| Mac (MPS) | Mac Studio M1 Pro 32GB | MPS early iteration, 2 runs |
 | Final | 8×H100 SXM 80GB | Primary training platform |
 
 **Step times at 768d (12L):** relu² 2x: 89ms | relu² 3x: 99ms | relu² 4x: 91ms | swiglu 3x: 127ms | leaky relu 3x: 103ms
