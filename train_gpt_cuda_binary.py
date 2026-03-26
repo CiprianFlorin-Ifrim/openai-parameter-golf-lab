@@ -60,6 +60,7 @@ class Hyperparameters:
     qk_gain_init = _e("QK_GAIN_INIT", 1.5, float)
     activation_type = _e("ACTIVATION", "swiglu")
     embed_dim = _e("EMBED_DIM", 0, int)
+    embed_rank = _e("EMBED_RANK", 0, int)   # 0 = disabled, >0 = low-rank factorized embedding
     bigram_hash = _e("BIGRAM_HASH", 0, bool)
     mtp_heads_count = _e("MTP_HEADS", 0, int)
     training_depth_recurrence = _e("TRAINING_DEPTH_RECURRENCE", 1, int)
@@ -108,6 +109,8 @@ class Hyperparameters:
     ema = _e("EMA", 0, bool)
     ema_decay = _e("EMA_DECAY", 0.995, float)
     ema_start_fraction = _e("EMA_START_FRACTION", 0.5, float)
+    checkpoint_every = _e("CHECKPOINT_EVERY", 0, int)   # 0 = disabled
+    checkpoint_dir = _e("CHECKPOINT_DIR", "./checkpoints")
 
 CTP = ("attn_scale","attn_scales","mlp_scale","mlp_scales","resid_mix","resid_mixes","q_gain","diff_lambda","skip_weight","skip_weights","vocab_bias","refiner.gate")
 
@@ -150,7 +153,7 @@ def quantize_to_int4(t: Tensor) -> tuple[Tensor, Tensor, list]:
         flat = F.pad(flat, (0, 1))
     low = (flat[0::2] + 8).to(torch.uint8)
     high = (flat[1::2] + 8).to(torch.uint8)
-    return low | (high << 4), scale.half().squeeze(-1), list(orig_shape)
+    return low | (high << 4), scale.bfloat16().squeeze(-1), list(orig_shape)
 
 def dequantize_from_int4(packed: Tensor, scale: Tensor, shape: list) -> Tensor:
     low = (packed & 0x0F).to(torch.int8) - 8
@@ -170,7 +173,7 @@ def dequantize_from_int4(packed: Tensor, scale: Tensor, shape: list) -> Tensor:
 # State dict serialization (binary + fp16/fp8/fp4)
 # ---------------------------------------------------------------------------
 def q_sd(state_dict: dict, group_size: int = 64, fp_storage=False, binary_override_names: set | None = None) -> tuple[dict, dict]:
-    "Binary for large 2D weight matrices, fp16/fp8/fp4 for everything else."
+    "Binary for large 2D weight matrices, bf16/fp8/fp4 for everything else. Binary scales stored as BF16."
     quantized = {}
     stats = {"binary_params": 0, "binary_bytes": 0, "fp_params": 0, "fp_bytes": 0}
     for name, tensor in state_dict.items():
@@ -189,14 +192,16 @@ def q_sd(state_dict: dict, group_size: int = 64, fp_storage=False, binary_overri
             pad = (group_size - t.shape[1] % group_size) % group_size
             t_padded = F.pad(t, (0, pad)) if pad > 0 else t
             t_grouped = t_padded.reshape(-1, group_size)
-            scale = t_grouped.abs().mean(-1, keepdim=True).clamp(min=1e-8).half().float()
+            # Compute scale in FP32, store as BF16: same 2 bytes as FP16 but full
+            # FP32 exponent range (8 bits vs 5) eliminates magnitude rounding errors
+            scale = t_grouped.abs().mean(-1, keepdim=True).clamp(min=1e-8)
             q = torch.where(t_grouped >= 0,
                             torch.ones_like(t_grouped, dtype=torch.int8),
                             -torch.ones_like(t_grouped, dtype=torch.int8))
             packed_bytes, n_bits = pack_binary(q)
             quantized[name] = {
                 "type": "binary", "packed": packed_bytes,
-                "scale": scale.half().squeeze(-1),
+                "scale": scale.bfloat16().squeeze(-1),  # BF16: full exponent range, same 2 bytes
                 "shape": list(t.shape), "padded_cols": t_padded.shape[1],
                 "group_size": group_size, "n_bits": n_bits,
                 "orig_shape": t_orig_shape,
@@ -213,7 +218,7 @@ def q_sd(state_dict: dict, group_size: int = 64, fp_storage=False, binary_overri
             stats["fp_params"] += t.numel()
             stats["fp_bytes"] += t.numel()
         else:
-            quantized[name] = {"type": "fp16", "data": t.half()}
+            quantized[name] = {"type": "bf16", "data": t.bfloat16()}
             stats["fp_params"] += t.numel()
             stats["fp_bytes"] += t.numel() * 2
     return quantized, stats
@@ -236,7 +241,7 @@ def deq_sd(quantized: dict, target_dtype=torch.bfloat16):
             out[name] = entry["data"].to(torch.float32).to(target_dtype).contiguous()
         elif entry["type"] == "fp4":
             out[name] = dequantize_from_int4(entry["packed"], entry["scale"], entry["shape"]).to(target_dtype).contiguous()
-        else:
+        else:  # bf16 (new) or fp16 (legacy checkpoints)
             out[name] = entry["data"].to(target_dtype).contiguous()
     return out
 
@@ -703,7 +708,7 @@ class GPT(nn.Module):
     def __init__(self, vocab_size, num_layers, model_dim, num_heads, num_kv_heads, mlp_mult,
                  tie_embeddings, tied_embed_init_std, logit_softcap, rope_base, qk_gain_init,
                  group_size: int = 64, activation: str = "swiglu", mtp_heads_count: int = 0,
-                 embed_dim: int = 0, attn_proj_type: str = "standard", logit_head_type: str = "standard",
+                 embed_dim: int = 0, embed_rank: int = 0, attn_proj_type: str = "standard", logit_head_type: str = "standard",
                  tversky_num_features: int = 16, tversky_feature_pools: int = 0,
                  training_depth_recurrence: int=1, fp_storage=False, bigram_hash: bool=False,
                  softcap_type: str="poly", no_cache: bool=False,
@@ -717,7 +722,17 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.softcap_type = softcap_type
         self.embed_dim = embed_dim if embed_dim > 0 else model_dim
-        self.tok_emb = QATEmbedding(vocab_size, self.embed_dim, fp_storage=fp_storage)
+        # Low-rank factorized embedding: stores vocab x embed_rank (tiny lookup),
+        # then projects to embed_dim via a learned linear. Reduces FP8 embedding
+        # storage from vocab*embed_dim to vocab*embed_rank + embed_rank*embed_dim.
+        # embed_rank=0 disables this and uses a standard vocab x embed_dim embedding.
+        self.embed_rank = embed_rank if embed_rank > 0 else 0
+        if self.embed_rank > 0:
+            self.tok_emb = QATEmbedding(vocab_size, self.embed_rank, fp_storage=fp_storage)
+            self.embed_rank_proj = QATLinear(self.embed_rank, self.embed_dim, bias=False, fp_storage=fp_storage)
+        else:
+            self.tok_emb = QATEmbedding(vocab_size, self.embed_dim, fp_storage=fp_storage)
+            self.embed_rank_proj = None
         self.bigram_emb = QATEmbedding(vocab_size, self.embed_dim, fp_storage=fp_storage) if bigram_hash else None
         if self.bigram_emb is not None:
             nn.init.zeros_(self.bigram_emb.weight)
@@ -790,6 +805,10 @@ class GPT(nn.Module):
             else:
                 proj = x
             weight = self.tok_emb.weight
+            if self.embed_rank_proj is not None:
+                # Reconstruct full vocab x embed_dim weight by composing
+                # the rank projection: W_full = W_rank @ W_proj.T
+                weight = weight @ self.embed_rank_proj.weight.T
             if self.lm_head_correction is not None:
                 weight = weight + self.lm_head_correction
             logits_raw = F.linear(proj, weight.to(x.dtype))
@@ -804,7 +823,10 @@ class GPT(nn.Module):
         x2 = x_sc * x_sc
         return s * torch.clamp(x_sc * (1.0 - x2 / 3.0 + x2 * x2 / 15.0), -1.0, 1.0)
     def forward(self, input_ids: Tensor, target_ids: Tensor, reduction: str = "mean", temperature: float = 1.0) -> Tensor:
-        x = self.tok_emb(input_ids).float()
+        x = self.tok_emb(input_ids)
+        if self.embed_rank_proj is not None:
+            x = self.embed_rank_proj(x)
+        x = x.float()
         if self.bigram_emb is not None:
             prev = F.pad(input_ids[:, :-1], (1, 0), value=0)
             x = x + self.bigram_emb(prev).float()
@@ -977,6 +999,65 @@ def find_temp(args, base_model, rank, world_size, device, grad_accum_steps,
     return best_t
 
 # ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+def _ckpt_path(checkpoint_dir: str, step: int) -> str:
+    return os.path.join(checkpoint_dir, f"ckpt_step{step:07d}.pt")
+
+def _latest_checkpoint(checkpoint_dir: str) -> str | None:
+    if not os.path.isdir(checkpoint_dir):
+        return None
+    ckpts = sorted(glob.glob(os.path.join(checkpoint_dir, "ckpt_step*.pt")))
+    return ckpts[-1] if ckpts else None
+
+def save_checkpoint(checkpoint_dir: str, step: int, base_model: nn.Module,
+                    optimizers: list, training_time_ms: float,
+                    _untied: bool, _seq_switched: bool, _batch_switched: bool,
+                    ema_model=None, _ema_started: bool = False, _ema_steps: int = 0) -> None:
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    path = _ckpt_path(checkpoint_dir, step)
+    payload = {
+        "step": step,
+        "training_time_ms": training_time_ms,
+        "model": base_model.state_dict(),
+        "optimizers": [o.state_dict() for o in optimizers],
+        "rng_cpu": torch.get_rng_state(),
+        "rng_cuda": torch.cuda.get_rng_state(),
+        "flags": {
+            "_untied": _untied,
+            "_seq_switched": _seq_switched,
+            "_batch_switched": _batch_switched,
+            "_ema_started": _ema_started,
+            "_ema_steps": _ema_steps,
+        },
+        "ema_model": ema_model.state_dict() if ema_model is not None else None,
+    }
+    tmp = path + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)   # atomic on POSIX
+
+def load_checkpoint(path: str, base_model: nn.Module, optimizers: list,
+                    device: torch.device, ema_model=None):
+    payload = torch.load(path, map_location=device, weights_only=False)
+    base_model.load_state_dict(payload["model"], strict=True)
+    for opt, sd in zip(optimizers, payload["optimizers"]):
+        opt.load_state_dict(sd)
+    if ema_model is not None and payload.get("ema_model") is not None:
+        ema_model.load_state_dict(payload["ema_model"], strict=True)
+    torch.set_rng_state(payload["rng_cpu"].cpu())
+    torch.cuda.set_rng_state(payload["rng_cuda"].cpu())
+    flags = payload.get("flags", {})
+    return (
+        payload["step"],
+        payload["training_time_ms"],
+        flags.get("_untied", False),
+        flags.get("_seq_switched", False),
+        flags.get("_batch_switched", False),
+        flags.get("_ema_started", False),
+        flags.get("_ema_steps", 0),
+    )
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -1033,7 +1114,7 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         group_size=args.bitnet_group_size, activation=args.activation_type, mtp_heads_count=args.mtp_heads_count,
-        embed_dim=args.embed_dim, attn_proj_type=args.attn_proj_type, logit_head_type=args.logit_head_type,
+        embed_dim=args.embed_dim, embed_rank=args.embed_rank, attn_proj_type=args.attn_proj_type, logit_head_type=args.logit_head_type,
         tversky_num_features=args.tversky_num_features, tversky_feature_pools=args.tversky_feature_pools,
         training_depth_recurrence=args.training_depth_recurrence, fp_storage=args.fp_storage,
         bigram_hash=args.bigram_hash, softcap_type=args.softcap_type, no_cache=(args.compile_mode == "reduce-overhead"),
@@ -1090,6 +1171,36 @@ def main() -> None:
             betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True)
         optimizers.append(opt_corr)
 
+    # --- EMA model ---
+    ema_model = None
+    _ema_started = False
+    _ema_steps = 0
+    if args.ema:
+        ema_model = copy.deepcopy(base_model)
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
+
+    # --- Checkpoint resume ---
+    _resume_step = 0
+    _resume_training_ms = 0.0
+    _resume_untied = False
+    _resume_seq_switched = False
+    _resume_batch_switched = False
+    _resume_ema_started = False
+    _resume_ema_steps = 0
+    if args.checkpoint_every > 0:
+        ckpt = _latest_checkpoint(args.checkpoint_dir)
+        if ckpt is not None:
+            log0(f"checkpoint found: {ckpt}")
+            (_resume_step, _resume_training_ms,
+             _resume_untied, _resume_seq_switched, _resume_batch_switched,
+             _resume_ema_started, _resume_ema_steps) = load_checkpoint(
+                ckpt, base_model, optimizers, device, ema_model)
+            log0(f"checkpoint loaded, starting from step {_resume_step} "
+                 f"(accumulated_train_time:{_resume_training_ms:.0f}ms)")
+        else:
+            log0("no checkpoint found, starting from scratch")
+
     # --- Log all hyperparameters ---
     log0("--- Hyperparameters ---", console=False)
     log0(" ".join(f"{a}={getattr(args,a)}" for a in sorted(dir(args)) if not a.startswith("_") and a not in ("train_files","val_files") and not callable(getattr(args,a))), console=False)
@@ -1114,6 +1225,13 @@ def main() -> None:
     _batch_switched = False
     active_seq_len = args.seq_len_start if args.seq_len_start > 0 else args.train_seq_len
     active_batch_tokens = args.batch_tokens_start if args.batch_tokens_start > 0 else args.train_batch_tokens
+    # If resuming after a schedule switch, apply the switched values immediately
+    if _resume_seq_switched:
+        _seq_switched = True
+        active_seq_len = args.train_seq_len
+    if _resume_batch_switched:
+        _batch_switched = True
+        active_batch_tokens = args.train_batch_tokens
     # --- Compiler warmup ---
     if args.warmup_steps > 0:
         _ms = {n: t.detach().cpu().clone() for n, t in base_model.state_dict().items()}
@@ -1135,23 +1253,27 @@ def main() -> None:
         zero_grad_all()
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    # --- EMA model ---
-    ema_model = None
-    _ema_started = False
-    _ema_steps = 0
-    if args.ema:
-        ema_model = copy.deepcopy(base_model)
-        for p in ema_model.parameters():
-            p.requires_grad_(False)
-
     # --- Main training loop ---
-    training_time_ms = 0.0
+    training_time_ms = _resume_training_ms   # accumulate across restarts
     stop_after_step: int | None = None
-    _untied = False
+    _untied = _resume_untied
+    _ema_started = _resume_ema_started
+    _ema_steps = _resume_ema_steps
     train_loss = torch.zeros((), device=device)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    step = 0
+    step = _resume_step
+    steps_this_session = 0
+
+    # Guard: budget already exhausted at resume time — skip straight to serialization
+    if max_wallclock_ms is None:
+        if step >= args.iterations:
+            log0(f"checkpoint step {step} >= iterations {args.iterations}, skipping training and saving model")
+            stop_after_step = step
+    else:
+        if training_time_ms >= max_wallclock_ms:
+            log0(f"checkpoint train_time {training_time_ms:.0f}ms >= wallclock cap {max_wallclock_ms:.0f}ms, skipping training and saving model")
+            stop_after_step = step
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
@@ -1262,10 +1384,19 @@ def main() -> None:
                     for ep, bp in zip(ema_model.parameters(), base_model.parameters()):
                         ep.data.mul_(decay).add_(bp.data, alpha=1.0 - decay)
         step += 1
+        steps_this_session += 1
         approx_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        
+
+        # Checkpoint save
+        if master_process and args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
+            save_checkpoint(args.checkpoint_dir, step, base_model, optimizers,
+                            approx_ms, _untied, _seq_switched, _batch_switched,
+                            ema_model, _ema_started, _ema_steps)
+            log0(f"step:{step} checkpoint saved to {_ckpt_path(args.checkpoint_dir, step)}")
+
         if args.train_log_every > 0 and step % args.train_log_every == 0:
-            log0(f"step:{step}/{args.iterations} loss:{train_loss.item():.4f} t:{approx_ms:.0f}ms avg:{approx_ms/step:.1f}ms")
+            session_ms = 1000.0 * (time.perf_counter() - t0)
+            log0(f"step:{step}/{args.iterations} loss:{train_loss.item():.4f} t:{approx_ms:.0f}ms step_avg:{session_ms/steps_this_session:.1f}ms")
         if args.churn_log_every > 0 and step % args.churn_log_every == 0:
             log0(f"step:{step} churn:{churn_fn(base_model, args.bitnet_group_size):.4f}")
         # Wallclock cap sync

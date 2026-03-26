@@ -60,7 +60,6 @@ class Hyperparameters:
     qk_gain_init = _e("QK_GAIN_INIT", 1.5, float)
     activation_type = _e("ACTIVATION", "swiglu")
     embed_dim = _e("EMBED_DIM", 0, int)
-    embed_rank = _e("EMBED_RANK", 0, int)   # 0 = disabled, >0 = low-rank factorized embedding
     bigram_hash = _e("BIGRAM_HASH", 0, bool)
     mtp_heads_count = _e("MTP_HEADS", 0, int)
     training_depth_recurrence = _e("TRAINING_DEPTH_RECURRENCE", 1, int)
@@ -156,7 +155,7 @@ def quantize_to_int4(t: Tensor) -> tuple[Tensor, Tensor, list]:
         flat = F.pad(flat, (0, 1))
     low = (flat[0::2] + 8).to(torch.uint8)
     high = (flat[1::2] + 8).to(torch.uint8)
-    return low | (high << 4), scale.bfloat16().squeeze(-1), list(orig_shape)
+    return low | (high << 4), scale.half().squeeze(-1), list(orig_shape)
 
 def dequantize_from_int4(packed: Tensor, scale: Tensor, shape: list) -> Tensor:
     low = (packed & 0x0F).to(torch.int8) - 8
@@ -762,11 +761,11 @@ class GPT(nn.Module):
     def __init__(self, vocab_size, num_layers, model_dim, num_heads, num_kv_heads, mlp_mult,
                  tie_embeddings, tied_embed_init_std, logit_softcap, rope_base, qk_gain_init,
                  group_size: int = 64, activation: str = "swiglu", mtp_heads_count: int = 0,
-                 embed_dim: int = 0, embed_rank: int = 0, attn_proj_type: str = "standard",
-                 logit_head_type: str = "standard", tversky_num_features: int = 16,
-                 tversky_feature_pools: int = 0, training_depth_recurrence: int=1,
-                 fp_storage=False, bigram_hash: bool=False, softcap_type: str="poly",
-                 no_cache: bool=False, smear: bool=False, rope_type: str="rope", yarn_max_len: int=4096,
+                 embed_dim: int = 0, attn_proj_type: str = "standard", logit_head_type: str = "standard",
+                 tversky_num_features: int = 16, tversky_feature_pools: int = 0,
+                 training_depth_recurrence: int=1, fp_storage=False, bigram_hash: bool=False,
+                 softcap_type: str="poly", no_cache: bool=False,
+                 smear: bool=False, rope_type: str="rope", yarn_max_len: int=4096,
                  train_seq_len: int=1024, tversky_membership: str="sigmoid",
                  diff_attn=False, mlp_groups=0, refiner=False, refiner_kernel=3):
         super().__init__()
@@ -776,17 +775,7 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.softcap_type = softcap_type
         self.embed_dim = embed_dim if embed_dim > 0 else model_dim
-        # Low-rank factorized embedding: stores vocab x embed_rank (tiny lookup),
-        # then projects to embed_dim via a learned linear. Reduces FP8 embedding
-        # storage from vocab*embed_dim to vocab*embed_rank + embed_rank*embed_dim.
-        # embed_rank=0 disables this and uses a standard vocab x embed_dim embedding.
-        self.embed_rank = embed_rank if embed_rank > 0 else 0
-        if self.embed_rank > 0:
-            self.tok_emb = QATEmbedding(vocab_size, self.embed_rank, fp_storage=fp_storage)
-            self.embed_rank_proj = QATLinear(self.embed_rank, self.embed_dim, bias=False, fp_storage=fp_storage)
-        else:
-            self.tok_emb = QATEmbedding(vocab_size, self.embed_dim, fp_storage=fp_storage)
-            self.embed_rank_proj = None
+        self.tok_emb = QATEmbedding(vocab_size, self.embed_dim, fp_storage=fp_storage)
         self.bigram_emb = QATEmbedding(vocab_size, self.embed_dim, fp_storage=fp_storage) if bigram_hash else None
         if self.bigram_emb is not None:
             nn.init.zeros_(self.bigram_emb.weight)
@@ -866,10 +855,6 @@ class GPT(nn.Module):
             else:
                 proj = x
             weight = self.tok_emb.weight
-            if self.embed_rank_proj is not None:
-                # Reconstruct full vocab x embed_dim weight by composing
-                # the rank projection: W_full = W_rank @ W_proj.T
-                weight = weight @ self.embed_rank_proj.weight.T
             if self.lm_head_correction is not None:
                 weight = weight + self.lm_head_correction
             logits_raw = F.linear(proj, weight.to(x.dtype))
@@ -886,10 +871,7 @@ class GPT(nn.Module):
         return s * torch.clamp(x_sc * (1.0 - x2 / 3.0 + x2 * x2 / 15.0), -1.0, 1.0)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor, reduction: str = "mean", temperature: float = 1.0) -> Tensor:
-        x = self.tok_emb(input_ids)
-        if self.embed_rank_proj is not None:
-            x = self.embed_rank_proj(x)
-        x = x.float()
+        x = self.tok_emb(input_ids).float()
         if self.bigram_emb is not None:
             prev = F.pad(input_ids[:, :-1], (1, 0), value=0)
             x = x + self.bigram_emb(prev).float()
@@ -1189,7 +1171,7 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         group_size=args.bitnet_group_size, activation=args.activation_type, mtp_heads_count=args.mtp_heads_count,
-        embed_dim=args.embed_dim, embed_rank=args.embed_rank, attn_proj_type=args.attn_proj_type, logit_head_type=args.logit_head_type,
+        embed_dim=args.embed_dim, attn_proj_type=args.attn_proj_type, logit_head_type=args.logit_head_type,
         tversky_num_features=args.tversky_num_features, tversky_feature_pools=args.tversky_feature_pools,
         training_depth_recurrence=args.training_depth_recurrence, fp_storage=args.fp_storage,
         bigram_hash=args.bigram_hash, softcap_type=args.softcap_type, no_cache=(args.compile_mode == "reduce-overhead"),
@@ -1548,3 +1530,24 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+====================================================================================================
+Python 3.13.12 | packaged by Anaconda, Inc. | (main, Feb 24 2026, 16:13:31) [GCC 14.3.0]
+PyTorch 2.10.0+cu128
+--- Hyperparameters ---
+activation_type=relu2 adam_eps=1e-08 adam_lr=0.05 adam_wd=0.05 attn_proj_type=standard batch_schedule_fraction=0.33 batch_tokens_start=0 beta1=0.9 beta2=0.95 bigram_hash=False bitnet_group_size=128 checkpoint_dir=./checkpoints checkpoint_every=0 churn_log_every=0 compile_mode=default corr_weight_lr=0.02 data_path=./data/datasets/fineweb10B_sp8192 diff_attn=False embed_dim=254 embed_lr=0.6 eval_depth_recurrence=0 fp_storage=True grad_clip_norm=0.0 head_lr=0.02 iterations=10000 logit_head_type=standard logit_softcap=10.0 matrix_lr=0.04 matrix_optimizer=muon max_wallclock_seconds=599.0 mlp_groups=0 mlp_mult=4 model_dim=512 mtp_heads_count=0 muon_backend_steps=3 muon_momentum=0.95 muon_momentum_warmup_start=0.85 muon_momentum_warmup_steps=500 muon_wd=0.0 num_heads=8 num_kv_heads=4 num_layers=24 qk_gain_init=2.25 refiner=False refiner_kernel=3 rope_base=5000.0 rope_type=yarn run_id=final_run_ternary_91 scalar_lr=0.02 seed=42 seq_len_start=0 seq_schedule_fraction=0.0 sliding_batch_size=1024 sliding_eval=False sliding_eval_stride=8 smear=False softcap_type=poly temp_scaling=True tie_embeddings=1 tied_embed_init_std=0.005 tied_embed_lr=0.02 tokenizer_path=./data/tokenizers/fineweb_8192_bpe.model train_batch_tokens=524288 train_log_every=1000 train_seq_len=1024 training_depth_recurrence=0 tversky_feature_pools=0 tversky_membership=sigmoid tversky_num_features=0 untie_at_fraction=0.0 val_batch_size=524288 val_loss_every=0 vocab_size=8192 warmdown_fraction=0.2 warmup_steps=5 yarn_max_len=2048
+params:75804864 L:24 d:512 h:8 kv:4 ws:8 ga:1 s:42
+warmup:1/5
+warmup:2/5
+warmup:3/5
+warmup:4/5
+warmup:5/5
+step:1000/10000 loss:3.3459 t:122622ms step_avg:122.6ms
+step:2000/10000 loss:3.3122 t:245293ms step_avg:122.6ms
+step:3000/10000 loss:3.1521 t:368026ms step_avg:122.7ms
+step:4000/10000 loss:3.3079 t:490711ms step_avg:122.7ms
+step:4890/10000 val_loss:3.0808 val_bpb:1.1929 train_time:599947ms zero_frac:0.256
+stopping_early: wallclock_cap train_time:599947ms step:4890/10000
+artifact:16.23MB ternary:69206016(14535337B) fp:2404544(2437504B) code:75720
+budget:16310636/16000000 (16.31/16.00MB) OVER
+final_ternary_roundtrip val_loss:3.0872 val_bpb:1.1954
+temp_scaling optimal_T:0.90 eval_time:237ms
