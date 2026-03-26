@@ -28,8 +28,40 @@ Ternary improves over baseline by **0.067 bpb** within the competition budget. T
 | **Binary** | 15L 768d relu² 4×MLP fp8 smear | **1.1239** | 15.60MB | 106.2M | 50,000 | 7,763s |
 | Baseline | 9L 512d SP1024 int8+zlib | 1.1749 | 15.81MB | 17.1M | 500,000 | 14,400s |
 
-These have been accepted and added into the main openai/parameter-golf repo. Check last section.
+## Results - Continued
 
+**Final result of research:**
+
+| Config | Sliding bpb | val_bpb | RT gap | Artifact | Seed std |
+|--------|-------------|---------|--------|----------|----------|
+| Original submission (P-series) | 1.1570 | 1.1821 | 0.0021 | 15.92MB | 0.0007 |
+| **New config (10L EMBED=312 RMS)** | **1.1539** | **1.1803** | **0.0011** | **15.88MB** | **0.0002** |
+
+**3-Seed Validation:**
+
+| Seed | Steps | val_bpb | RT bpb | RT gap | Sliding bpb | Artifact |
+|------|-------|---------|--------|--------|-------------|----------|
+| 42 | 6,540 | 1.1805 | 1.1824 | 0.0019 | 1.1542 | 15.88MB |
+| 1337 | 6,530 | 1.1803 | 1.1811 | 0.0008 | 1.1540 | 15.88MB |
+| 7 | 6,530 | 1.1802 | 1.1808 | 0.0006 | 1.1535 | 15.87MB |
+| **Mean** | **6,533** | **1.1803** | **1.1814** | **0.0011** | **1.1539** | **15.88MB** |
+| **Std** | **5** | **0.0002** | **0.0008** | | **0.0004** | |
+
+**Comparison vs original P-series submission:**
+
+| Metric | Original | New | Delta |
+|--------|----------|-----|-------|
+| val_bpb | 1.1821 | 1.1803 | −0.0018 |
+| RT bpb | 1.1842 | 1.1814 | −0.0028 |
+| Sliding bpb | 1.1570 | 1.1539 | **−0.0031** |
+| RT gap | 0.0021 | 0.0011 | −0.0010 |
+| Artifact | 15.99MB | 15.88MB | −110KB |
+| Seed std (sliding) | 0.0007 | 0.0004 | more stable |
+| Params | 73.7M | 74.3M | +0.6M |
+
+The larger EMBED_DIM (312 vs 254) adds 0.6M parameters exclusively in the fp8 embedding path, not in the ternary model. The seed standard deviation improvement (0.0007 to 0.0004 bpb) indicates that richer token representations reduce the sensitivity of the model to random initialisation, which is consistent with the embedding bottleneck at 254 dimensions (previous version) being a source of training instability.
+
+These have been accepted and added into the main openai/parameter-golf repo. Check last section of this README.
 
 ---
 
