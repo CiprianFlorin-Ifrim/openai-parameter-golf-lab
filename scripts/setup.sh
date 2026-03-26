@@ -59,8 +59,8 @@ echo "[3/5] Requirements..."
 if python3 -c "import torch, sentencepiece, numpy" 2>/dev/null; then
     echo "    Core packages already installed -- skipping."
 else
-    pip install --upgrade pip -q
-    pip install -r requirements.txt -q
+    pip install --upgrade pip 
+    pip install -r requirements.txt 
     echo "    Installed."
 fi
 
