@@ -1,5 +1,7 @@
 # Parameter Golf - OpenAI Challenge
 **Author:** Ciprian-Florin Ifrim | **Date:** March 2026
+<br>
+<br>
 Submission for the [OpenAI Parameter Golf Challenge](https://github.com/openai/parameter-golf): train the best language model that fits in a **16MB artifact** and trains in **under 10 minutes on 8xH100 SXM GPUs**, evaluated by bits-per-byte (BPB) on the FineWeb validation set.
 
 This repo uses work previously done (July 2024 - September 2025) on the **SPARROW/SPARROW-Next & AURI MLM (Microcontroller Language Model/Micro Language Model - Private Research)** together with the [Ternary Transformer Lab Personal Repository](https://github.com/CiprianFlorin-Ifrim/ternary-transformer-lab) and [Transformer Tversky Prototypes Lab](https://github.com/CiprianFlorin-Ifrim/transformer-tversky-prototypes-lab).
