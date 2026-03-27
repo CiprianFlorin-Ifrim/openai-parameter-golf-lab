@@ -1,0 +1,1073 @@
+"""
+To JEPA Or Not To JEPA, That Is Le Question
+=============================================
+A byte-level SSM JEPA model for OpenAI's Parameter Golf Challenge.
+Ciprian-Florin Ifrim - March 2026
+Architecture: Raw bytes (256 vocab) → Shared Embedding → Mamba-2 SSM stack → JEPA prediction
+Training:     MSE embedding prediction + SIGReg Gaussian regularizer (from LeWorldModel)
+Evaluation:   Energy-based scoring via embedding distances → BPB
+LeWM-style JEPA (Maes et al. 2026) + Mamba-2 SSM (Gu & Dao 2024) + byte-level I/O (Meta's BLT)
+- No tokenizer. No attention. No cross-entropy during training.
+- The model learns to predict the next byte's latent representation.
+- SIGReg prevents representation collapse without EMA or stop-gradient.
+- At eval, byte probabilities are derived purely from embedding distances.
+"""
+
+import copy
+import glob
+import io
+import lzma
+import math
+import os
+import random
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch import Tensor, nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# ---------------------------------------------------------------------------
+# Mamba-2 (requires mamba_ssm package with CUDA kernels)
+# ---------------------------------------------------------------------------
+from mamba_ssm import Mamba2
+
+# ---------------------------------------------------------------------------
+# Hyperparameters
+# ---------------------------------------------------------------------------
+def _e(k, d, t=str):
+    v = os.environ.get(k, str(d))
+    if t == bool:
+        return bool(int(v))
+    return t(v)
+
+
+class Hyperparameters:
+    # Data
+    data_path      = _e("DATA_PATH", "./data/datasets/fineweb_bytes")
+    train_files    = os.path.join(data_path, "fineweb_train_*.bin")
+    val_files      = os.path.join(data_path, "fineweb_val_*.bin")
+    run_id         = os.environ.get("RUN_ID", f"jepa_{int(time.time())}")
+    seed           = _e("SEED", 42, int)
+
+    # Model
+    model_dim      = _e("MODEL_DIM", 512, int)
+    num_layers     = _e("NUM_LAYERS", 12, int)
+    d_state        = _e("D_STATE", 64, int)
+    d_conv         = _e("D_CONV", 4, int)
+    expand         = _e("EXPAND", 2, int)
+    predictor_hidden_mult = _e("PREDICTOR_HIDDEN_MULT", 2, int)
+    embed_dim      = _e("EMBED_DIM", 0, int)  # 0 = same as model_dim
+
+    # JEPA / Loss
+    sigreg_lambda  = _e("SIGREG_LAMBDA", 1.0, float)
+    sigreg_knots   = _e("SIGREG_KNOTS", 17, int)
+    sigreg_num_proj = _e("SIGREG_NUM_PROJ", 0, int)  # 0 = auto (2x embed_dim)
+    ce_weight      = _e("CE_WEIGHT", 0.0, float)  # 0 = pure JEPA, >0 = add CE
+    jepa_weight    = _e("JEPA_WEIGHT", 1.0, float)  # weight on JEPA MSE loss, 0 = disable
+    detach_targets = _e("DETACH_TARGETS", 0, bool)  # LeWM: no stop-gradient (SIGReg prevents collapse)
+
+    # Training
+    train_seq_len  = _e("TRAIN_SEQ_LEN", 4096, int)
+    train_batch_tokens = _e("TRAIN_BATCH_TOKENS", 524288, int)
+    iterations     = _e("ITERATIONS", 10000, int)
+    warmup_steps   = _e("WARMUP_STEPS", 20, int)
+    warmdown_fraction = _e("WARMDOWN_FRACTION", 0.2, float)
+    max_wallclock_seconds = _e("MAX_WALLCLOCK_SECONDS", 0.0, float)
+    val_batch_size = _e("VAL_BATCH_SIZE", 524288, int)
+    val_loss_every = _e("VAL_LOSS_EVERY", 500, int)
+    train_log_every = _e("TRAIN_LOG_EVERY", 10, int)
+
+    # Optimizer
+    matrix_lr      = _e("MATRIX_LR", 0.04, float)
+    scalar_lr      = _e("SCALAR_LR", 0.02, float)
+    embed_lr       = _e("EMBED_LR", 0.02, float)
+    muon_momentum  = _e("MUON_MOMENTUM", 0.95, float)
+    muon_backend_steps = _e("MUON_BACKEND_STEPS", 5, int)
+    muon_momentum_warmup_start = _e("MUON_MOMENTUM_WARMUP_START", 0.85, float)
+    muon_momentum_warmup_steps = _e("MUON_MOMENTUM_WARMUP_STEPS", 500, int)
+    muon_wd        = _e("MUON_WD", 0.04, float)
+    adam_wd        = _e("ADAM_WD", 0.05, float)
+    beta1          = _e("BETA1", 0.9, float)
+    beta2          = _e("BETA2", 0.95, float)
+    adam_eps        = _e("ADAM_EPS", 1e-8, float)
+    grad_clip_norm = _e("GRAD_CLIP_NORM", 1.0, float)  # 0 = disabled
+
+    # Eval options
+    sliding_eval   = _e("SLIDING_EVAL", 0, bool)
+    sliding_eval_stride = _e("SLIDING_EVAL_STRIDE", 64, int)
+    sliding_batch_size = _e("SLIDING_BATCH_SIZE", 64, int)
+    temp_scaling   = _e("TEMP_SCALING", 1, bool)
+
+    compile_mode   = _e("COMPILE_MODE", "default")
+
+
+# ---------------------------------------------------------------------------
+# SIGReg — Sketch Isotropic Gaussian Regularizer (from LeWorldModel)
+# Prevents representation collapse by enforcing Gaussian latent distribution.
+# Maes, Le Lidec, Scieur, LeCun, Balestriero (2026)
+# ---------------------------------------------------------------------------
+class SIGReg(nn.Module):
+    def __init__(self, knots: int = 17, num_proj: int = 1024):
+        super().__init__()
+        self.num_proj = num_proj
+        t = torch.linspace(0, 3, knots, dtype=torch.float32)
+        dt = 3 / (knots - 1)
+        weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
+        weights[[0, -1]] = dt
+        window = torch.exp(-t.square() / 2.0)
+        self.register_buffer("t", t)
+        self.register_buffer("phi", window)             # Gaussian characteristic function
+        self.register_buffer("weights", weights * window)
+
+    def forward(self, embeddings: Tensor) -> Tensor:
+        """
+        embeddings: (B, T, D) or (N, D)
+        Returns: scalar regularization loss
+        """
+        if embeddings.ndim == 3:
+            emb = embeddings.reshape(-1, embeddings.size(-1))
+        else:
+            emb = embeddings
+        N, D = emb.shape
+
+        # Random projections onto unit sphere
+        A = torch.randn(D, self.num_proj, device=emb.device, dtype=emb.dtype)
+        A = A / A.norm(dim=0, keepdim=True)
+
+        # Empirical characteristic function vs Gaussian target
+        proj = emb @ A                                    # (N, num_proj)
+        x_t = proj.unsqueeze(-1) * self.t                 # (N, num_proj, knots)
+        err = (x_t.cos().mean(0) - self.phi).square() + x_t.sin().mean(0).square()
+        return (err @ self.weights).mean() * N
+
+
+# ---------------------------------------------------------------------------
+# Model components
+# ---------------------------------------------------------------------------
+class RMSNorm(nn.Module):
+    def __init__(self, eps: float | None = None):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
+
+
+class SSMBlock(nn.Module):
+    """SSM block with pre-RMSNorm and residual. Requires mamba_ssm CUDA package."""
+    def __init__(self, d_model: int, d_state: int = 64, d_conv: int = 4, expand: int = 2):
+        super().__init__()
+        self.norm = RMSNorm()
+        self.ssm = Mamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x + self.ssm(self.norm(x))
+
+
+# ---------------------------------------------------------------------------
+# ByteJEPA — the core model (aligned with LeWorldModel, Maes et al. 2026)
+# ---------------------------------------------------------------------------
+class MLP(nn.Module):
+    """Simple MLP with LayerNorm for projectors."""
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.fc2(self.act(self.norm(self.fc1(x))))
+
+
+class ByteJEPA(nn.Module):
+    """
+    Byte-level JEPA with SSM backbone, aligned with LeWorldModel (Maes et al. 2026).
+
+    Architecture (following LeWM):
+        Encoder:    bytes → byte_embed → [SSM blocks] → RMSNorm → h (hidden states)
+        Projector:  h → z (projected latent space for JEPA)
+        Predictor:  z_t → predicted z_{t+1}
+        Pred_proj:  predictor output → projected prediction space
+
+    Training (LeWM-style, fully end-to-end, NO stop-gradient):
+        JEPA loss:  MSE(pred_proj(predictor(projector(h_t))), projector(h_{t+1}))
+        SIGReg:     Gaussian regularizer on z (projected embeddings)
+        CE loss:    lm_head(h) → byte probabilities (for BPB evaluation)
+
+    Key LeWM principles:
+        - No EMA, no stop-gradient — SIGReg alone prevents collapse
+        - Projector separates JEPA prediction space from encoder hidden space
+        - CE operates on raw hidden states, JEPA on projected space (no interference)
+    """
+
+    def __init__(self, model_dim: int = 512, num_layers: int = 12,
+                 d_state: int = 64, d_conv: int = 4, expand: int = 2,
+                 embed_dim: int = 0, predictor_hidden_mult: int = 2):
+        super().__init__()
+        self.model_dim = model_dim
+        embed_dim = embed_dim if embed_dim > 0 else model_dim
+
+        # Byte embedding (input)
+        self.byte_embed = nn.Embedding(256, model_dim)
+        nn.init.normal_(self.byte_embed.weight, std=0.02)
+
+        # SSM encoder backbone
+        self.blocks = nn.ModuleList([
+            SSMBlock(model_dim, d_state, d_conv, expand)
+            for _ in range(num_layers)
+        ])
+        self.norm = RMSNorm()
+
+        # Projector: h → z (maps encoder hidden states to JEPA prediction space)
+        self.projector = MLP(model_dim, model_dim * 2, embed_dim)
+
+        # Predictor: z_t → predicted z_{t+1} (latent dynamics model)
+        pred_hidden = embed_dim * predictor_hidden_mult
+        self.predictor = nn.Sequential(
+            nn.Linear(embed_dim, pred_hidden),
+            nn.GELU(),
+            nn.Linear(pred_hidden, embed_dim),
+        )
+        nn.init.zeros_(self.predictor[-1].weight)
+        nn.init.zeros_(self.predictor[-1].bias)
+
+        # Pred projector: maps predictor output to same space as projector output
+        self.pred_proj = MLP(embed_dim, model_dim * 2, embed_dim)
+
+        # LM head: decodes raw hidden states to byte probabilities (for CE + eval)
+        # Small MLP for better decoding capacity at negligible cost (256 output)
+        self.lm_head = nn.Sequential(
+            nn.Linear(model_dim, model_dim),
+            nn.GELU(),
+            nn.Linear(model_dim, 256),
+        )
+
+    def encode(self, byte_ids: Tensor) -> Tensor:
+        """byte_ids: (B, T) → hidden states h: (B, T, D)"""
+        x = self.byte_embed(byte_ids)
+        for block in self.blocks:
+            x = block(x)
+        return self.norm(x)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor,
+                reduction: str = "mean", temperature: float | None = None) -> Tensor:
+        """Compute NLL via lm_head (for eval / BPB calculation)."""
+        h = self.encode(input_ids)
+        logits = self.lm_head(h)
+        if temperature is not None and temperature != 1.0:
+            logits = logits / temperature
+
+        logits_flat = logits.reshape(-1, 256)
+        targets_flat = target_ids.reshape(-1)
+
+        if reduction == "none":
+            return F.cross_entropy(logits_flat.float(), targets_flat,
+                                   reduction="none").reshape(input_ids.shape)
+        return F.cross_entropy(logits_flat.float(), targets_flat)
+
+    def compute_jepa_loss(self, input_ids: Tensor, target_ids: Tensor,
+                          sigreg: SIGReg, sigreg_lambda: float = 1.0,
+                          ce_weight: float = 0.0, jepa_weight: float = 1.0,
+                          detach_targets: bool = False) -> tuple[Tensor, dict]:
+        """
+        LeWM-aligned training loss.
+
+        JEPA prediction in projected space (fully end-to-end, no stop-gradient):
+            z = projector(h)
+            pred_z = pred_proj(predictor(z_t))
+            target_z = z_{t+1}   ← NO detach (LeWM principle)
+            jepa_loss = MSE(pred_z, target_z)
+
+        SIGReg on projected embeddings z (prevents collapse without heuristics).
+        CE on raw hidden states h (separate path, no interference with JEPA).
+        """
+        h = self.encode(input_ids)                        # (B, T, D)
+        z = self.projector(h)                             # (B, T, embed_dim)
+
+        diagnostics = {}
+        loss = torch.zeros((), device=h.device)
+
+        # JEPA: predict next projected embedding (LeWM-style, end-to-end)
+        if jepa_weight > 0:
+            pred_z = self.predictor(z[:, :-1, :])         # (B, T-1, embed_dim)
+            pred_z = self.pred_proj(pred_z)               # (B, T-1, embed_dim)
+            target_z = z[:, 1:, :]                        # (B, T-1, embed_dim)
+            if detach_targets:
+                target_z = target_z.detach()
+            jepa_loss = (pred_z - target_z).pow(2).mean()
+            loss = loss + jepa_weight * jepa_loss
+            diagnostics["jepa"] = jepa_loss.detach()
+
+        # SIGReg on projected embeddings (LeWM's anti-collapse mechanism)
+        if sigreg_lambda > 0:
+            sig_loss = sigreg(z)
+            loss = loss + sigreg_lambda * sig_loss
+            diagnostics["sigreg"] = sig_loss.detach()
+
+        # CE: lm_head on raw hidden states (separate from JEPA path)
+        if ce_weight > 0:
+            logits = self.lm_head(h)
+            ce_loss = F.cross_entropy(logits.reshape(-1, 256),
+                                      target_ids.reshape(-1))
+            loss = loss + ce_weight * ce_loss
+            diagnostics["ce"] = ce_loss.detach()
+
+        return loss, diagnostics
+
+
+# ---------------------------------------------------------------------------
+# Muon optimizer (Newton-Schulz orthogonalized momentum)
+# ---------------------------------------------------------------------------
+def _ns_orth(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    X /= X.norm() + eps
+    transposed = G.size(0) > G.size(1)
+    if transposed:
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    return X.T if transposed else X
+
+ns_orth = _ns_orth   # will be compiled in main()
+
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr: float, momentum: float,
+                 backend_steps: int, nesterov: bool = True, wd: float = 0.0):
+        super().__init__(params, dict(lr=lr, momentum=momentum,
+                                      backend_steps=backend_steps, nesterov=nesterov, wd=wd))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        distributed = dist.is_available() and dist.is_initialized()
+        world_size = dist.get_world_size() if distributed else 1
+        rank = dist.get_rank() if distributed else 0
+
+        for group in self.param_groups:
+            params = group["params"]
+            if not params:
+                continue
+            lr, mom = group["lr"], group["momentum"]
+            steps, nesterov = group["backend_steps"], group["nesterov"]
+            wd = group.get("wd", 0.0)
+
+            total = sum(p.numel() for p in params)
+            flat = torch.zeros(total, device=params[0].device, dtype=torch.bfloat16)
+            cur = 0
+            for i, p in enumerate(params):
+                if i % world_size == rank and p.grad is not None:
+                    g = p.grad
+                    state = self.state[p]
+                    if "buf" not in state:
+                        state["buf"] = torch.zeros_like(g)
+                    buf = state["buf"]
+                    buf.mul_(mom).add_(g)
+                    if nesterov:
+                        g = g.add(buf, alpha=mom)
+                    g = F.rms_norm(g.float(), (g.size(-1),)).bfloat16()
+                    g = ns_orth(g, steps=steps)
+                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    flat[cur:cur + p.numel()] = g.reshape(-1)
+                cur += p.numel()
+
+            if distributed:
+                dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+
+            cur = 0
+            for p in params:
+                g = flat[cur:cur + p.numel()].view_as(p).to(p.dtype)
+                if wd > 0:
+                    p.mul_(1 - lr * wd)
+                p.add_(g, alpha=-lr)
+                cur += p.numel()
+
+
+# ---------------------------------------------------------------------------
+# Data loading — raw byte shards
+# ---------------------------------------------------------------------------
+def load_byte_shard(path: Path) -> Tensor:
+    """Load a challenge-format shard (header + uint16 values)."""
+    header_bytes = 256 * np.dtype("<i4").itemsize
+    header = np.fromfile(path, dtype="<i4", count=256)
+    if header.size != 256 or int(header[0]) != 20240520:
+        raise ValueError(f"Unexpected shard header for {path}")
+    num_tokens = int(header[2])
+    tokens = np.fromfile(path, dtype="<u2", count=num_tokens, offset=header_bytes)
+    return torch.from_numpy(tokens.astype(np.uint8, copy=False))
+
+
+class ByteStream:
+    def __init__(self, pattern: str):
+        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if not self.files:
+            raise FileNotFoundError(f"No files for pattern: {pattern}")
+        self.file_idx = 0
+        self.data = load_byte_shard(self.files[0])
+        self.pos = 0
+
+    def _advance(self):
+        self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.data = load_byte_shard(self.files[self.file_idx])
+        self.pos = 0
+
+    def take(self, n: int) -> Tensor:
+        chunks = []
+        remaining = n
+        while remaining > 0:
+            avail = self.data.numel() - self.pos
+            if avail <= 0:
+                self._advance()
+                continue
+            k = min(remaining, avail)
+            chunks.append(self.data[self.pos:self.pos + k])
+            self.pos += k
+            remaining -= k
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+
+class DistributedByteLoader:
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+        self.rank, self.world_size, self.device = rank, world_size, device
+        self.stream = ByteStream(pattern)
+
+    def next_batch(self, global_tokens: int, seq_len: int,
+                   grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        per_rank_span = local_tokens + 1
+        chunk = self.stream.take(per_rank_span * self.world_size)
+        start = self.rank * per_rank_span
+        local = chunk[start:start + per_rank_span]
+        local = local.pin_memory().to(self.device, non_blocking=True).to(torch.int64)
+        x = local[:-1].reshape(-1, seq_len)
+        y = local[1:].reshape(-1, seq_len)
+        return x, y
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+def load_val_bytes(pattern: str, seq_len: int,
+                   max_bytes: int = int(os.environ.get("VAL_MAX_TOKENS", 500_000))) -> Tensor:
+    files = sorted(glob.glob(pattern))
+    assert files, f"No files: {pattern}"
+    data = torch.cat([load_byte_shard(Path(p)) for p in files]).contiguous()
+    if max_bytes > 0:
+        data = data[:max_bytes + 1]
+    u = ((data.numel() - 1) // seq_len) * seq_len
+    return data[:u + 1]
+
+
+def eval_val(args, model, rank, world_size, device, grad_accum_steps,
+             val_bytes: Tensor, temperature: float = 1.0):
+    """Evaluate BPB using energy-based scoring."""
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    local_batch_seqs = max(1, local_batch_tokens // args.train_seq_len)
+    total_seqs = (val_bytes.numel() - 1) // args.train_seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_start in range(seq_start, seq_end, local_batch_seqs):
+            batch_end = min(batch_start + local_batch_seqs, seq_end)
+            raw_start = batch_start * args.train_seq_len
+            raw_end = batch_end * args.train_seq_len + 1
+            local = val_bytes[raw_start:raw_end].to(device=device, dtype=torch.int64)
+            x = local[:-1].reshape(-1, args.train_seq_len)
+            y = local[1:].reshape(-1, args.train_seq_len)
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                batch_loss = model(x, y, temperature=temperature).detach()
+
+            n = float(y.numel())
+            loss_sum += batch_loss.to(torch.float64) * n
+            byte_count += n
+
+    if dist.is_available() and dist.is_initialized():
+        for t in (loss_sum, byte_count):
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+    val_loss = loss_sum / byte_count
+    # Each prediction is one byte, so BPB = loss_nats / ln(2)
+    bpb = val_loss.item() / math.log(2.0)
+    model.train()
+    return float(val_loss.item()), float(bpb)
+
+
+def eval_val_sliding(args, model, rank, world_size, device, grad_accum_steps,
+                     val_bytes: Tensor, stride: int = 64, temperature: float = 1.0):
+    """Sliding window evaluation for better BPB."""
+    seq_len = args.train_seq_len
+    batch_size = args.sliding_batch_size
+    total_bytes = val_bytes.numel() - 1
+    all_starts = list(range(0, total_bytes - seq_len, stride))
+    my_starts = all_starts[rank::world_size]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        for i in range(0, len(my_starts), batch_size):
+            batch_starts = my_starts[i:i + batch_size]
+            starts_t = torch.tensor(batch_starts, dtype=torch.int64)
+            offsets = torch.arange(seq_len + 1, dtype=torch.int64)
+            indices = starts_t.unsqueeze(1) + offsets.unsqueeze(0)
+            local_batch = val_bytes[indices].to(device=device, dtype=torch.int64, non_blocking=True)
+            x, y = local_batch[:, :-1], local_batch[:, 1:]
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                per_byte_loss = model(x, y, reduction="none", temperature=temperature).detach()
+
+            for b, start in enumerate(batch_starts):
+                score_from = 0 if start == 0 else seq_len - stride
+                scored = per_byte_loss[b, score_from:]
+                loss_sum += scored.to(torch.float64).sum()
+                byte_count += scored.numel()
+
+    if dist.is_available() and dist.is_initialized():
+        for t in (loss_sum, byte_count):
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+    val_loss = loss_sum / byte_count
+    bpb = val_loss.item() / math.log(2.0)
+    model.train()
+    return float(val_loss.item()), float(bpb)
+
+
+# ---------------------------------------------------------------------------
+# JEPA Diagnostics — verify representation quality independent of BPB
+# ---------------------------------------------------------------------------
+def jepa_diagnostics(model: nn.Module, val_bytes: Tensor, device: torch.device,
+                     seq_len: int = 2048, max_samples: int = 50000):
+    """
+    Check if JEPA is learning in the projected space (LeWM-aligned diagnostics).
+    1. JEPA quality: cosine similarity between pred_proj(predictor(z_t)) and z_{t+1}
+    2. lm_head top-k: is correct byte in top-k from lm_head(h)?
+    3. Linear probe: fresh linear on frozen hidden states h
+    """
+    model.eval()
+    base = model.module if hasattr(model, 'module') else model
+    base = base._orig_mod if hasattr(base, '_orig_mod') else base
+
+    n = min(max_samples + 1, val_bytes.numel())
+    data = val_bytes[:n].to(device=device, dtype=torch.int64)
+    x = data[:-1].reshape(-1, seq_len)
+    y = data[1:].reshape(-1, seq_len)
+    n_seqs = min(x.shape[0], max_samples // seq_len)
+    x, y = x[:n_seqs], y[:n_seqs]
+
+    cos_sims = []
+    jepa_mses = []
+    lm_top1 = lm_top5 = lm_top10 = 0
+    total = 0
+    all_hidden = []
+    all_targets = []
+
+    with torch.no_grad():
+        for i in range(n_seqs):
+            xi, yi = x[i:i+1], y[i:i+1]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                h = base.encode(xi)                           # (1, T, D)
+                z = base.projector(h)                         # (1, T, embed_dim)
+
+                # JEPA prediction quality in projected space
+                pred_z = base.predictor(z[:, :-1, :])         # (1, T-1, embed_dim)
+                pred_z = base.pred_proj(pred_z)               # (1, T-1, embed_dim)
+
+            target_z = z[:, 1:, :]                            # (1, T-1, embed_dim)
+            cos = F.cosine_similarity(pred_z[0].float(), target_z[0].float(), dim=-1)
+            cos_sims.append(cos.mean().item())
+            jepa_mses.append((pred_z - target_z).pow(2).mean().item())
+
+            # lm_head top-k accuracy (on raw hidden states h)
+            h_f = h[0].float()
+            logits = base.lm_head(h_f)                        # (T, 256)
+            targets = yi[0]
+            preds = logits.argsort(dim=-1, descending=True)
+            lm_top1 += (preds[:, :1] == targets.unsqueeze(1)).any(1).sum().item()
+            lm_top5 += (preds[:, :5] == targets.unsqueeze(1)).any(1).sum().item()
+            lm_top10 += (preds[:, :10] == targets.unsqueeze(1)).any(1).sum().item()
+            total += targets.numel()
+
+            if len(all_hidden) * seq_len < 100000:
+                all_hidden.append(h_f.cpu())
+                all_targets.append(targets.cpu())
+
+    # Linear probe on frozen hidden states
+    probe_bpb = float('nan')
+    if all_hidden:
+        H = torch.cat(all_hidden, dim=0)
+        T = torch.cat(all_targets, dim=0)
+        n_train = int(0.8 * H.shape[0])
+        H_tr, H_val = H[:n_train].to(device), H[n_train:].to(device)
+        T_tr, T_val = T[:n_train].to(device), T[n_train:].to(device)
+        probe = nn.Linear(H.shape[-1], 256).to(device)
+        opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
+        bs = min(4096, n_train)
+        for _ in range(200):
+            idx = torch.randint(0, n_train, (bs,), device=device)
+            loss = F.cross_entropy(probe(H_tr[idx]), T_tr[idx])
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.inference_mode():
+            probe_bpb = F.cross_entropy(probe(H_val), T_val).item() / math.log(2.0)
+
+    model.train()
+    return {
+        "jepa_cos_sim": sum(cos_sims) / max(len(cos_sims), 1),
+        "jepa_mse": sum(jepa_mses) / max(len(jepa_mses), 1),
+        "lm_top1": lm_top1 / max(total, 1),
+        "lm_top5": lm_top5 / max(total, 1),
+        "lm_top10": lm_top10 / max(total, 1),
+        "probe_bpb": probe_bpb,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Temperature search (eval-time calibration)
+# ---------------------------------------------------------------------------
+def find_best_temperature(args, model, rank, world_size, device,
+                          grad_accum_steps, val_bytes):
+    best_t, best_loss = 1.0, float("inf")
+    for t in [0.5, 0.7, 0.85, 0.95, 1.0, 1.1, 1.3, 1.5, 2.0]:
+        loss, _ = eval_val(args, model, rank, world_size, device,
+                           grad_accum_steps, val_bytes, temperature=t)
+        if loss < best_loss:
+            best_loss = loss
+            best_t = t
+    return best_t
+
+
+# ---------------------------------------------------------------------------
+# Serialization — FP16 + LZMA
+# ---------------------------------------------------------------------------
+def save_model(model: nn.Module, code: str, path: str) -> tuple[int, int]:
+    """Save model as FP16 + LZMA compressed. Returns (model_bytes, code_bytes)."""
+    sd = {k: v.detach().cpu().half() for k, v in model.state_dict().items()}
+    buf = io.BytesIO()
+    torch.save(sd, buf)
+    compressed = lzma.compress(buf.getvalue(), preset=9)
+    with open(path, "wb") as f:
+        f.write(compressed)
+    code_bytes = len(code.encode("utf-8"))
+    return len(compressed), code_bytes
+
+
+def load_model(path: str, model: nn.Module, device: torch.device) -> nn.Module:
+    """Load FP16 + LZMA compressed model."""
+    with open(path, "rb") as f:
+        data = lzma.decompress(f.read())
+    sd = torch.load(io.BytesIO(data), map_location="cpu", weights_only=False)
+    sd = {k: v.float() for k, v in sd.items()}
+    model.load_state_dict(sd, strict=True)
+    return model.to(device)
+
+
+# ---------------------------------------------------------------------------
+# Data preparation utility
+# ---------------------------------------------------------------------------
+def prepare_byte_data(tokenized_dir: str, tokenizer_path: str, output_dir: str,
+                      max_shards: int = 0):
+    """Convert tokenized FineWeb shards to raw byte shards."""
+    import sentencepiece as spm
+    sp = spm.SentencePieceProcessor(model_file=tokenizer_path)
+    os.makedirs(output_dir, exist_ok=True)
+
+    shard_files = sorted(glob.glob(os.path.join(tokenized_dir, "fineweb_*.bin")))
+    if max_shards > 0:
+        # Always include val shards
+        val_shards = [f for f in shard_files if "val" in f]
+        train_shards = [f for f in shard_files if "train" in f][:max_shards]
+        shard_files = val_shards + train_shards
+
+    for shard_file in shard_files:
+        header = np.fromfile(shard_file, dtype="<i4", count=256)
+        if header.size != 256 or int(header[0]) != 20240520:
+            print(f"Skipping {shard_file}: unexpected header")
+            continue
+        num_tokens = int(header[2])
+        header_bytes = 256 * np.dtype("<i4").itemsize
+        tokens = np.fromfile(shard_file, dtype="<u2", count=num_tokens, offset=header_bytes)
+
+        # Decode tokens → text → UTF-8 bytes
+        text = sp.decode(tokens.tolist())
+        raw_bytes = np.frombuffer(text.encode("utf-8"), dtype=np.uint8)
+
+        out_name = os.path.basename(shard_file)
+        out_path = os.path.join(output_dir, out_name)
+        raw_bytes.tofile(out_path)
+        print(f"  {shard_file} → {out_path} ({len(raw_bytes):,} bytes)")
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+SCALAR_PARAM_PATTERNS = ("bias",)
+
+
+def main() -> None:
+    # Handle --prepare-data mode
+    if "--prepare-data" in sys.argv:
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--prepare-data", action="store_true")
+        parser.add_argument("--tokenized-dir", required=True)
+        parser.add_argument("--tokenizer-path", required=True)
+        parser.add_argument("--output-dir", required=True)
+        parser.add_argument("--max-shards", type=int, default=0)
+        pargs = parser.parse_args()
+        prepare_byte_data(pargs.tokenized_dir, pargs.tokenizer_path,
+                          pargs.output_dir, pargs.max_shards)
+        return
+
+    args = Hyperparameters()
+    code = Path(__file__).read_text(encoding="utf-8")
+
+    global ns_orth
+    ns_orth = torch.compile(_ns_orth)
+
+    # --- Distributed setup ---
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    grad_accum_steps = max(1, 8 // world_size)
+    grad_scale = 1.0 / grad_accum_steps
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA required")
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    if distributed:
+        dist.init_process_group(backend="nccl", device_id=device)
+        dist.barrier()
+    master = rank == 0
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    os.makedirs("logs/cuda/", exist_ok=True)
+    logfile = f"logs/cuda/{args.run_id}.txt" if master else None
+
+    def log0(msg: str, console: bool = True):
+        if not master:
+            return
+        if console:
+            print(msg)
+        if logfile:
+            with open(logfile, "a", encoding="utf-8") as f:
+                print(msg, file=f)
+
+    log0(code, console=False)
+    log0("=" * 100, console=False)
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    # --- Validation data ---
+    val_bytes = load_val_bytes(args.val_files, args.train_seq_len)
+
+    # --- Model ---
+    base_model = ByteJEPA(
+        model_dim=args.model_dim,
+        num_layers=args.num_layers,
+        d_state=args.d_state,
+        d_conv=args.d_conv,
+        expand=args.expand,
+        embed_dim=args.embed_dim,
+        predictor_hidden_mult=args.predictor_hidden_mult,
+    ).to(device).float()
+
+    # Auto-scale SIGReg projections if not set
+    effective_embed_dim = args.embed_dim if args.embed_dim > 0 else args.model_dim
+    sigreg_num_proj = args.sigreg_num_proj if args.sigreg_num_proj > 0 else effective_embed_dim * 2
+    sigreg = SIGReg(knots=args.sigreg_knots, num_proj=sigreg_num_proj).to(device)
+
+    torch._dynamo.config.optimize_ddp = False
+    compiled_model = torch.compile(base_model,
+                                   mode=args.compile_mode if args.compile_mode != "default" else None)
+    model = DDP(compiled_model, device_ids=[local_rank],
+                broadcast_buffers=False, gradient_as_bucket_view=True) if distributed else compiled_model
+
+    # --- Optimizers ---
+    matrix_params = [p for n, p in base_model.named_parameters()
+                     if p.ndim == 2 and not any(pat in n for pat in SCALAR_PARAM_PATTERNS)]
+    scalar_params = [p for n, p in base_model.named_parameters()
+                     if p.ndim < 2 or any(pat in n for pat in SCALAR_PARAM_PATTERNS)]
+    embed_params = [base_model.byte_embed.weight]
+    embed_ids = {id(p) for p in embed_params}
+    matrix_params = [p for p in matrix_params if id(p) not in embed_ids]
+
+    opt_muon = Muon(matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum,
+                    backend_steps=args.muon_backend_steps, wd=args.muon_wd)
+    for g in opt_muon.param_groups:
+        g["base_lr"] = args.matrix_lr
+
+    opt_scalar = torch.optim.AdamW(
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2), eps=args.adam_eps,
+        weight_decay=args.adam_wd, fused=True)
+
+    opt_embed = torch.optim.AdamW(
+        [{"params": embed_params, "lr": args.embed_lr, "base_lr": args.embed_lr}],
+        betas=(args.beta1, args.beta2), eps=args.adam_eps,
+        weight_decay=args.adam_wd, fused=True)
+
+    optimizers = [opt_muon, opt_scalar, opt_embed]
+
+    # --- Log config ---
+    n_params = sum(p.numel() for p in base_model.parameters())
+    log0(f"ByteJEPA | params:{n_params:,} layers:{args.num_layers} dim:{args.model_dim} "
+         f"d_state:{args.d_state} expand:{args.expand} | "
+         f"ssm_backend:mamba2_cuda "
+         f"ws:{world_size} ga:{grad_accum_steps}")
+    log0(f"JEPA: jepa_weight={args.jepa_weight} sigreg_lambda={args.sigreg_lambda} ce_weight={args.ce_weight} detach_targets={args.detach_targets}")
+
+    # --- Data loader ---
+    train_loader = DistributedByteLoader(args.train_files, rank, world_size, device)
+
+    def zero_grad_all():
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
+
+    max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+
+    def lr_mul(step: int, elapsed_ms: float):
+        """Linear warmup then cosine-like warmdown."""
+        # Warmup phase
+        if args.warmup_steps > 0 and step < args.warmup_steps:
+            return (step + 1) / args.warmup_steps
+        # Warmdown phase
+        if args.warmdown_fraction <= 0:
+            return 1.0
+        if max_wallclock_ms is None:
+            wd_start = int(args.iterations * (1.0 - args.warmdown_fraction))
+            if step < wd_start:
+                return 1.0
+            return max((args.iterations - step) / max(args.iterations * args.warmdown_fraction, 1), 0.0)
+        wd_ms = max_wallclock_ms * args.warmdown_fraction
+        remaining = max(max_wallclock_ms - elapsed_ms, 0.0)
+        return remaining / max(wd_ms, 1e-9) if remaining <= wd_ms else 1.0
+
+    # --- Main training loop ---
+    training_time_ms = 0.0
+    stop_after_step: int | None = None
+    train_loss = torch.zeros((), device=device)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    step = 0
+
+    while True:
+        last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
+
+        # Validation
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            torch.cuda.synchronize()
+            training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            val_loss, val_bpb = eval_val(args, model, rank, world_size, device,
+                                         grad_accum_steps, val_bytes)
+            log0(f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                 f"train_time:{training_time_ms:.0f}ms")
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        if last_step:
+            break
+
+        # LR scheduling
+        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        scale = lr_mul(step, elapsed_ms)
+
+        # Muon momentum warmup
+        if args.muon_momentum_warmup_steps > 0:
+            frac = min(step / args.muon_momentum_warmup_steps, 1.0)
+            for g in opt_muon.param_groups:
+                g["momentum"] = ((1 - frac) * args.muon_momentum_warmup_start
+                                 + frac * args.muon_momentum)
+
+        # Training step
+        zero_grad_all()
+        train_loss.zero_()
+
+        for micro in range(grad_accum_steps):
+            if distributed:
+                model.require_backward_grad_sync = micro == grad_accum_steps - 1
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len,
+                                           grad_accum_steps)
+            torch.compiler.cudagraph_mark_step_begin()
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss, diag = base_model.compute_jepa_loss(
+                    x, y, sigreg, args.sigreg_lambda, args.ce_weight,
+                    args.jepa_weight, args.detach_targets)
+            train_loss.add_(loss.detach())
+            (loss * grad_scale).backward()
+
+        train_loss /= grad_accum_steps
+
+        # Gradient clipping
+        if args.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+
+        # Optimizer step with LR scaling
+        for opt in optimizers:
+            for g in opt.param_groups:
+                g["lr"] = g["base_lr"] * scale
+            opt.step()
+        zero_grad_all()
+
+        step += 1
+        approx_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+
+        if args.train_log_every > 0 and step % args.train_log_every == 0:
+            d_str = " ".join(f"{k}:{v.item():.4f}" for k, v in diag.items())
+            log0(f"step:{step}/{args.iterations} loss:{train_loss.item():.4f} "
+                 f"{d_str} t:{approx_ms:.0f}ms")
+
+        # Wallclock cap
+        if stop_after_step is None and max_wallclock_ms is not None and step % 10 == 0:
+            reached = approx_ms >= max_wallclock_ms
+            if distributed:
+                cap_t = torch.tensor(int(reached), device=device)
+                dist.all_reduce(cap_t, op=dist.ReduceOp.MAX)
+                reached = bool(cap_t.item())
+            if reached:
+                stop_after_step = step
+
+    # --- Serialization ---
+    if master:
+        model_bytes, code_bytes = save_model(base_model, code, "final_model.fp16.ptz")
+        total = model_bytes + code_bytes
+        log0(f"artifact:{model_bytes / 1e6:.2f}MB code:{code_bytes} "
+             f"total:{total}/{16_000_000} ({total / 1e6:.2f}/16.00MB) "
+             f"{'FITS' if total <= 16_000_000 else 'OVER'}")
+
+    # --- Roundtrip evaluation ---
+    if distributed:
+        dist.barrier()
+
+    load_model("final_model.fp16.ptz", base_model, device)
+    torch._dynamo.reset()
+
+    q_loss, q_bpb = eval_val(args, model, rank, world_size, device,
+                              grad_accum_steps, val_bytes)
+    log0(f"final_roundtrip val_loss:{q_loss:.4f} val_bpb:{q_bpb:.4f}")
+
+    # JEPA representation diagnostics
+    if master:
+        diag = jepa_diagnostics(model, val_bytes, device, seq_len=args.train_seq_len)
+        log0(f"jepa_diagnostics cos_sim:{diag['jepa_cos_sim']:.4f} jepa_mse:{diag['jepa_mse']:.4f} "
+             f"lm_top1:{diag['lm_top1']:.4f} lm_top5:{diag['lm_top5']:.4f} "
+             f"lm_top10:{diag['lm_top10']:.4f} probe_bpb:{diag['probe_bpb']:.4f}")
+
+    # Temperature search
+    if args.temp_scaling:
+        torch.cuda.synchronize()
+        t_temp = time.perf_counter()
+        opt_temp = find_best_temperature(args, base_model, rank, world_size,
+                                         device, grad_accum_steps, val_bytes)
+        torch.cuda.synchronize()
+        log0(f"temp_scaling optimal_T:{opt_temp:.2f} "
+             f"time:{1000.0 * (time.perf_counter() - t_temp):.0f}ms")
+
+        # Re-eval with optimal temperature
+        t_loss, t_bpb = eval_val(args, model, rank, world_size, device,
+                                  grad_accum_steps, val_bytes, temperature=opt_temp)
+        log0(f"final_temped val_loss:{t_loss:.4f} val_bpb:{t_bpb:.4f} T={opt_temp:.2f}")
+
+    # Sliding window eval
+    if args.sliding_eval:
+        torch.cuda.synchronize()
+        t_sw = time.perf_counter()
+        temp = opt_temp if args.temp_scaling else 1.0
+        sw_loss, sw_bpb = eval_val_sliding(args, base_model, rank, world_size,
+                                            device, grad_accum_steps, val_bytes,
+                                            stride=args.sliding_eval_stride,
+                                            temperature=temp)
+        torch.cuda.synchronize()
+        log0(f"final_sliding val_loss:{sw_loss:.4f} val_bpb:{sw_bpb:.4f} "
+             f"(stride={args.sliding_eval_stride}, T={temp:.2f}) "
+             f"time:{1000.0 * (time.perf_counter() - t_sw):.0f}ms")
+
+    if distributed:
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+====================================================================================================
+ByteJEPA | params:3,578,512 layers:6 dim:256 d_state:64 expand:2 | ssm_backend:mamba2_cuda ws:1 ga:8
+JEPA: jepa_weight=1.0 sigreg_lambda=0.01 ce_weight=1.0 detach_targets=False
+step:0/500 val_loss:5.5667 val_bpb:8.0310 train_time:0ms
+step:10/500 loss:11.1718 jepa:0.5222 sigreg:556.0000 ce:5.2133 t:13400ms
+step:20/500 loss:6.4437 jepa:0.9270 sigreg:148.0000 ce:3.8639 t:14492ms
+step:30/500 loss:4.5085 jepa:0.8117 sigreg:107.5000 ce:3.2647 t:15613ms
+step:40/500 loss:3.5488 jepa:0.6514 sigreg:77.5000 ce:2.3228 t:16730ms
+step:50/500 loss:3.1750 jepa:0.4887 sigreg:58.0000 ce:1.7734 t:17812ms
+step:60/500 loss:2.7695 jepa:0.4378 sigreg:47.5000 ce:1.9307 t:18905ms
+step:70/500 loss:2.6388 jepa:0.3695 sigreg:39.0000 ce:1.8969 t:20021ms
+step:80/500 loss:2.3588 jepa:0.3126 sigreg:40.2500 ce:1.6633 t:21114ms
+step:90/500 loss:2.3442 jepa:0.2724 sigreg:32.0000 ce:1.5668 t:22200ms
+step:100/500 loss:2.6452 jepa:0.2374 sigreg:35.0000 ce:1.6775 t:23311ms
+step:100/500 val_loss:1.7127 val_bpb:2.4709 train_time:23312ms
+step:110/500 loss:2.3157 jepa:0.2344 sigreg:41.5000 ce:1.7889 t:24396ms
+step:120/500 loss:2.1002 jepa:0.1830 sigreg:38.2500 ce:1.3213 t:25482ms
+step:130/500 loss:2.2280 jepa:0.1965 sigreg:31.7500 ce:1.7369 t:26595ms
+step:140/500 loss:2.0990 jepa:0.1805 sigreg:29.6250 ce:1.6710 t:27751ms
+step:150/500 loss:1.9770 jepa:0.1602 sigreg:29.7500 ce:1.6439 t:28909ms
+step:160/500 loss:2.0843 jepa:0.1466 sigreg:26.2500 ce:1.5185 t:30070ms
+step:170/500 loss:1.9179 jepa:0.1522 sigreg:27.1250 ce:1.7531 t:31227ms
+step:180/500 loss:1.9485 jepa:0.1357 sigreg:25.0000 ce:1.5810 t:32373ms
+step:190/500 loss:2.1278 jepa:0.1331 sigreg:25.0000 ce:1.5938 t:33494ms
+step:200/500 loss:1.8478 jepa:0.1185 sigreg:24.8750 ce:1.3284 t:34572ms
+step:200/500 val_loss:1.5877 val_bpb:2.2905 train_time:34573ms
+step:210/500 loss:1.9443 jepa:0.1134 sigreg:24.7500 ce:1.4888 t:35688ms
+step:220/500 loss:1.7864 jepa:0.1072 sigreg:28.0000 ce:1.3291 t:36833ms
+step:230/500 loss:1.9873 jepa:0.1133 sigreg:25.0000 ce:1.5203 t:37939ms
+step:240/500 loss:1.9544 jepa:0.1189 sigreg:21.6250 ce:1.7352 t:39027ms
+step:250/500 loss:1.7981 jepa:0.1025 sigreg:21.8750 ce:1.3916 t:40128ms
+step:260/500 loss:1.7477 jepa:0.1041 sigreg:21.5000 ce:1.5523 t:41235ms
+step:270/500 loss:1.8198 jepa:0.1019 sigreg:21.8750 ce:1.4779 t:42384ms
+step:280/500 loss:1.7703 jepa:0.0969 sigreg:25.2500 ce:1.4902 t:43528ms
+step:290/500 loss:1.6964 jepa:0.0902 sigreg:22.0000 ce:1.2732 t:44678ms
+step:300/500 loss:1.8276 jepa:0.0943 sigreg:21.0000 ce:1.5548 t:45823ms
+step:300/500 val_loss:1.5442 val_bpb:2.2278 train_time:45823ms
+step:310/500 loss:1.8196 jepa:0.0853 sigreg:22.0000 ce:1.3196 t:46975ms
+step:320/500 loss:1.7354 jepa:0.0851 sigreg:21.2500 ce:1.3745 t:48126ms
+step:330/500 loss:1.8452 jepa:0.0899 sigreg:19.7500 ce:1.5079 t:49273ms
+step:340/500 loss:1.8411 jepa:0.0878 sigreg:18.7500 ce:1.4885 t:50427ms
+step:350/500 loss:2.0863 jepa:0.0975 sigreg:26.6250 ce:1.8486 t:51574ms
+step:360/500 loss:1.7904 jepa:0.0857 sigreg:22.0000 ce:1.4193 t:52674ms
+step:370/500 loss:1.7924 jepa:0.0901 sigreg:19.7500 ce:1.6574 t:53785ms
+step:380/500 loss:1.6605 jepa:0.0790 sigreg:19.5000 ce:1.3968 t:54898ms
+step:390/500 loss:1.7554 jepa:0.0835 sigreg:19.1250 ce:1.5753 t:56028ms
+step:400/500 loss:1.8159 jepa:0.0862 sigreg:19.5000 ce:1.6836 t:57116ms
+step:400/500 val_loss:1.5216 val_bpb:2.1952 train_time:57116ms
+step:410/500 loss:1.9077 jepa:0.0755 sigreg:20.3750 ce:1.4483 t:58208ms
+step:420/500 loss:1.8501 jepa:0.0873 sigreg:22.8750 ce:1.6005 t:59291ms
+step:430/500 loss:1.9462 jepa:0.0829 sigreg:18.0000 ce:1.6501 t:60382ms
+step:440/500 loss:1.7967 jepa:0.0820 sigreg:18.6250 ce:1.6804 t:61465ms
+step:450/500 loss:1.6989 jepa:0.0759 sigreg:18.0000 ce:1.5350 t:62593ms
+step:460/500 loss:1.7464 jepa:0.0776 sigreg:17.1250 ce:1.5026 t:63717ms
+step:470/500 loss:1.7401 jepa:0.0740 sigreg:16.5000 ce:1.6027 t:64812ms
+step:480/500 loss:1.7213 jepa:0.0721 sigreg:16.5000 ce:1.5249 t:65908ms
+step:490/500 loss:1.7692 jepa:0.0692 sigreg:17.8750 ce:1.4805 t:67026ms
+step:500/500 loss:1.8581 jepa:0.0948 sigreg:22.5000 ce:2.2909 t:68177ms
+step:500/500 val_loss:1.4851 val_bpb:2.1426 train_time:68177ms
+artifact:6.45MB code:42684 total:6487984/16000000 (6.49/16.00MB) FITS
+final_roundtrip val_loss:1.4851 val_bpb:2.1426
+jepa_diagnostics cos_sim:0.9636 jepa_mse:0.0693 lm_top1:0.5604 lm_top5:0.8464 lm_top10:0.9231 probe_bpb:2.5520
+temp_scaling optimal_T:1.00 time:53ms
+final_temped val_loss:1.4851 val_bpb:2.1426 T=1.00
