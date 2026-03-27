@@ -1,6 +1,6 @@
 # Notable: 1.1090 BPB - 74.3M Ternary U-Net Transformer (100k steps, unconstrained)
 
-**Extended training of [#640](https://github.com/openai/parameter-golf/pull/640) / [#641](https://github.com/openai/parameter-golf/pull/641) config with SmearGate enabled**
+**Extended training of [#640](https://github.com/openai/parameter-golf/pull/640) / [#641](https://github.com/openai/parameter-golf/pull/641) / [#920](https://github.com/openai/parameter-golf/pull/920) config with SmearGate enabled**
 
 **val_bpb: 1.1090** (sliding, stride=16, T=0.90) | **15.95 MB** artifact | 8xH100 SXM, ~3h
 
@@ -45,13 +45,13 @@ The practical impact - FP16 vs BF16 scale storage at different training lengths:
 
 Without the changes applied, this extended run would have produced a 0.03+ BPB roundtrip gap, making the artifact unusable. The changes cost zero bytes and keep the gap at 0.0022 even at 100k steps.
 
-## Changes from #641
+## Changes from #920
 
 - **SmearGate enabled** (`SMEAR=1`): learnable per-block gating for residual smoothing. Adds minimal params, provides small quality benefit at extended training.
 - **100k iterations, no wallclock cap** (`MAX_WALLCLOCK_SECONDS=0`)
 - **Checkpointing every 5k steps** for interruptible compute
 
-Architecture, quantisation, compression, and all other hyperparameters identical to #641.
+Architecture, quantisation, compression, and all other hyperparameters identical to #920.
 
 ## Setup and Run
 
