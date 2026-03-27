@@ -1,0 +1,1311 @@
+"""
+To JEPA Or Not To JEPA, That Is Le Question
+=============================================
+A byte-level SSM JEPA model for OpenAI's Parameter Golf Challenge.
+Ciprian-Florin Ifrim - March 2026
+Architecture: Raw bytes (256 vocab) → Shared Embedding → Mamba-2 SSM stack → JEPA prediction
+Training:     MSE embedding prediction + SIGReg Gaussian regularizer (from LeWorldModel)
+Evaluation:   Energy-based scoring via embedding distances → BPB
+LeWM-style JEPA (Maes et al. 2026) + Mamba-2 SSM (Gu & Dao 2024) + byte-level I/O (Meta's BLT)
+- No tokenizer. No attention. No cross-entropy during training.
+- The model learns to predict the next byte's latent representation.
+- SIGReg prevents representation collapse without EMA or stop-gradient.
+- At eval, byte probabilities are derived purely from embedding distances.
+"""
+
+import copy
+import glob
+import io
+import lzma
+import math
+import os
+import random
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch import Tensor, nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# ---------------------------------------------------------------------------
+# Mamba-2 (requires mamba_ssm package with CUDA kernels)
+# ---------------------------------------------------------------------------
+from mamba_ssm import Mamba2
+
+# ---------------------------------------------------------------------------
+# Hyperparameters
+# ---------------------------------------------------------------------------
+def _e(k, d, t=str):
+    v = os.environ.get(k, str(d))
+    if t == bool:
+        return bool(int(v))
+    return t(v)
+
+
+class Hyperparameters:
+    # Data
+    data_path      = _e("DATA_PATH", "./data/datasets/fineweb_bytes")
+    train_files    = os.path.join(data_path, "fineweb_train_*.bin")
+    val_files      = os.path.join(data_path, "fineweb_val_*.bin")
+    run_id         = os.environ.get("RUN_ID", f"jepa_{int(time.time())}")
+    seed           = _e("SEED", 42, int)
+
+    # Model
+    model_dim      = _e("MODEL_DIM", 512, int)
+    num_layers     = _e("NUM_LAYERS", 12, int)
+    d_state        = _e("D_STATE", 64, int)
+    d_conv         = _e("D_CONV", 4, int)
+    expand         = _e("EXPAND", 2, int)
+    predictor_hidden_mult = _e("PREDICTOR_HIDDEN_MULT", 2, int)
+    embed_dim      = _e("EMBED_DIM", 0, int)  # 0 = same as model_dim
+
+    # JEPA / Loss
+    sigreg_lambda  = _e("SIGREG_LAMBDA", 1.0, float)
+    sigreg_knots   = _e("SIGREG_KNOTS", 17, int)
+    sigreg_num_proj = _e("SIGREG_NUM_PROJ", 0, int)  # 0 = auto (2x embed_dim)
+    ce_weight      = _e("CE_WEIGHT", 0.0, float)  # 0 = pure JEPA, >0 = add CE
+    jepa_weight    = _e("JEPA_WEIGHT", 1.0, float)  # weight on JEPA MSE loss, 0 = disable
+    detach_targets = _e("DETACH_TARGETS", 0, bool)  # LeWM: no stop-gradient (SIGReg prevents collapse)
+
+    # Training
+    train_seq_len  = _e("TRAIN_SEQ_LEN", 4096, int)
+    train_batch_tokens = _e("TRAIN_BATCH_TOKENS", 524288, int)
+    iterations     = _e("ITERATIONS", 10000, int)
+    warmup_steps   = _e("WARMUP_STEPS", 20, int)
+    warmdown_fraction = _e("WARMDOWN_FRACTION", 0.2, float)
+    max_wallclock_seconds = _e("MAX_WALLCLOCK_SECONDS", 0.0, float)
+    val_batch_size = _e("VAL_BATCH_SIZE", 524288, int)
+    val_loss_every = _e("VAL_LOSS_EVERY", 500, int)
+    train_log_every = _e("TRAIN_LOG_EVERY", 10, int)
+
+    # Optimizer
+    matrix_lr      = _e("MATRIX_LR", 0.04, float)
+    scalar_lr      = _e("SCALAR_LR", 0.02, float)
+    embed_lr       = _e("EMBED_LR", 0.02, float)
+    muon_momentum  = _e("MUON_MOMENTUM", 0.95, float)
+    muon_backend_steps = _e("MUON_BACKEND_STEPS", 5, int)
+    muon_momentum_warmup_start = _e("MUON_MOMENTUM_WARMUP_START", 0.85, float)
+    muon_momentum_warmup_steps = _e("MUON_MOMENTUM_WARMUP_STEPS", 500, int)
+    muon_wd        = _e("MUON_WD", 0.04, float)
+    adam_wd        = _e("ADAM_WD", 0.05, float)
+    beta1          = _e("BETA1", 0.9, float)
+    beta2          = _e("BETA2", 0.95, float)
+    adam_eps        = _e("ADAM_EPS", 1e-8, float)
+    grad_clip_norm = _e("GRAD_CLIP_NORM", 1.0, float)  # 0 = disabled
+
+    # Eval options
+    sliding_eval   = _e("SLIDING_EVAL", 0, bool)
+    sliding_eval_stride = _e("SLIDING_EVAL_STRIDE", 64, int)
+    sliding_batch_size = _e("SLIDING_BATCH_SIZE", 64, int)
+    temp_scaling   = _e("TEMP_SCALING", 1, bool)
+
+    compile_mode   = _e("COMPILE_MODE", "default")
+    quant_bits     = _e("QUANT_BITS", 6, int)  # INT-N for large matrices (4, 5, 6)
+
+
+# ---------------------------------------------------------------------------
+# SIGReg — Sketch Isotropic Gaussian Regularizer (from LeWorldModel)
+# Prevents representation collapse by enforcing Gaussian latent distribution.
+# Maes, Le Lidec, Scieur, LeCun, Balestriero (2026)
+# ---------------------------------------------------------------------------
+class SIGReg(nn.Module):
+    def __init__(self, knots: int = 17, num_proj: int = 1024):
+        super().__init__()
+        self.num_proj = num_proj
+        t = torch.linspace(0, 3, knots, dtype=torch.float32)
+        dt = 3 / (knots - 1)
+        weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
+        weights[[0, -1]] = dt
+        window = torch.exp(-t.square() / 2.0)
+        self.register_buffer("t", t)
+        self.register_buffer("phi", window)             # Gaussian characteristic function
+        self.register_buffer("weights", weights * window)
+
+    def forward(self, embeddings: Tensor) -> Tensor:
+        """
+        embeddings: (B, T, D) or (N, D)
+        Returns: scalar regularization loss
+        """
+        if embeddings.ndim == 3:
+            emb = embeddings.reshape(-1, embeddings.size(-1))
+        else:
+            emb = embeddings
+        N, D = emb.shape
+
+        # Random projections onto unit sphere
+        A = torch.randn(D, self.num_proj, device=emb.device, dtype=emb.dtype)
+        A = A / A.norm(dim=0, keepdim=True)
+
+        # Empirical characteristic function vs Gaussian target
+        proj = emb @ A                                    # (N, num_proj)
+        x_t = proj.unsqueeze(-1) * self.t                 # (N, num_proj, knots)
+        err = (x_t.cos().mean(0) - self.phi).square() + x_t.sin().mean(0).square()
+        return (err @ self.weights).mean() * N
+
+
+# ---------------------------------------------------------------------------
+# Model components
+# ---------------------------------------------------------------------------
+class RMSNorm(nn.Module):
+    def __init__(self, eps: float | None = None):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
+
+
+class SSMBlock(nn.Module):
+    """SSM block with pre-RMSNorm and residual. Requires mamba_ssm CUDA package."""
+    def __init__(self, d_model: int, d_state: int = 64, d_conv: int = 4, expand: int = 2):
+        super().__init__()
+        self.norm = RMSNorm()
+        self.ssm = Mamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x + self.ssm(self.norm(x))
+
+
+# ---------------------------------------------------------------------------
+# ByteJEPA — the core model (aligned with LeWorldModel, Maes et al. 2026)
+# ---------------------------------------------------------------------------
+class MLP(nn.Module):
+    """Simple MLP with LayerNorm for projectors."""
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.fc2(self.act(self.norm(self.fc1(x))))
+
+
+class ByteJEPA(nn.Module):
+    """
+    Byte-level JEPA with SSM backbone, aligned with LeWorldModel (Maes et al. 2026).
+
+    Architecture (following LeWM):
+        Encoder:    bytes → byte_embed → [SSM blocks] → RMSNorm → h (hidden states)
+        Projector:  h → z (projected latent space for JEPA)
+        Predictor:  z_t → predicted z_{t+1}
+        Pred_proj:  predictor output → projected prediction space
+
+    Training (LeWM-style, fully end-to-end, NO stop-gradient):
+        JEPA loss:  MSE(pred_proj(predictor(projector(h_t))), projector(h_{t+1}))
+        SIGReg:     Gaussian regularizer on z (projected embeddings)
+        CE loss:    lm_head(h) → byte probabilities (for BPB evaluation)
+
+    Key LeWM principles:
+        - No EMA, no stop-gradient — SIGReg alone prevents collapse
+        - Projector separates JEPA prediction space from encoder hidden space
+        - CE operates on raw hidden states, JEPA on projected space (no interference)
+    """
+
+    def __init__(self, model_dim: int = 512, num_layers: int = 12,
+                 d_state: int = 64, d_conv: int = 4, expand: int = 2,
+                 embed_dim: int = 0, predictor_hidden_mult: int = 2):
+        super().__init__()
+        self.model_dim = model_dim
+        embed_dim = embed_dim if embed_dim > 0 else model_dim
+
+        # Byte embedding (input)
+        self.byte_embed = nn.Embedding(256, model_dim)
+        nn.init.normal_(self.byte_embed.weight, std=0.02)
+
+        # SSM encoder backbone
+        self.blocks = nn.ModuleList([
+            SSMBlock(model_dim, d_state, d_conv, expand)
+            for _ in range(num_layers)
+        ])
+        self.norm = RMSNorm()
+
+        # Projector: h → z (maps encoder hidden states to JEPA prediction space)
+        self.projector = MLP(model_dim, model_dim * 2, embed_dim)
+
+        # Predictor: z_t → predicted z_{t+1} (latent dynamics model)
+        pred_hidden = embed_dim * predictor_hidden_mult
+        self.predictor = nn.Sequential(
+            nn.Linear(embed_dim, pred_hidden),
+            nn.GELU(),
+            nn.Linear(pred_hidden, embed_dim),
+        )
+        nn.init.zeros_(self.predictor[-1].weight)
+        nn.init.zeros_(self.predictor[-1].bias)
+
+        # Pred projector: maps predictor output to same space as projector output
+        self.pred_proj = MLP(embed_dim, model_dim * 2, embed_dim)
+
+        # LM head: decodes raw hidden states to byte probabilities (for CE + eval)
+        # Small MLP for better decoding capacity at negligible cost (256 output)
+        self.lm_head = nn.Sequential(
+            nn.Linear(model_dim, model_dim),
+            nn.GELU(),
+            nn.Linear(model_dim, 256),
+        )
+
+    def encode(self, byte_ids: Tensor) -> Tensor:
+        """byte_ids: (B, T) → hidden states h: (B, T, D)"""
+        x = self.byte_embed(byte_ids)
+        for block in self.blocks:
+            x = block(x)
+        return self.norm(x)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor,
+                reduction: str = "mean", temperature: float | None = None) -> Tensor:
+        """Compute NLL via lm_head (for eval / BPB calculation)."""
+        h = self.encode(input_ids)
+        logits = self.lm_head(h)
+        if temperature is not None and temperature != 1.0:
+            logits = logits / temperature
+
+        logits_flat = logits.reshape(-1, 256)
+        targets_flat = target_ids.reshape(-1)
+
+        if reduction == "none":
+            return F.cross_entropy(logits_flat.float(), targets_flat,
+                                   reduction="none").reshape(input_ids.shape)
+        return F.cross_entropy(logits_flat.float(), targets_flat)
+
+    def compute_jepa_loss(self, input_ids: Tensor, target_ids: Tensor,
+                          sigreg: SIGReg, sigreg_lambda: float = 1.0,
+                          ce_weight: float = 0.0, jepa_weight: float = 1.0,
+                          detach_targets: bool = False) -> tuple[Tensor, dict]:
+        """
+        LeWM-aligned training loss.
+
+        JEPA prediction in projected space (fully end-to-end, no stop-gradient):
+            z = projector(h)
+            pred_z = pred_proj(predictor(z_t))
+            target_z = z_{t+1}   ← NO detach (LeWM principle)
+            jepa_loss = MSE(pred_z, target_z)
+
+        SIGReg on projected embeddings z (prevents collapse without heuristics).
+        CE on raw hidden states h (separate path, no interference with JEPA).
+        """
+        h = self.encode(input_ids)                        # (B, T, D)
+        z = self.projector(h)                             # (B, T, embed_dim)
+
+        diagnostics = {}
+        loss = torch.zeros((), device=h.device)
+
+        # JEPA: predict next projected embedding (LeWM-style, end-to-end)
+        if jepa_weight > 0:
+            pred_z = self.predictor(z[:, :-1, :])         # (B, T-1, embed_dim)
+            pred_z = self.pred_proj(pred_z)               # (B, T-1, embed_dim)
+            target_z = z[:, 1:, :]                        # (B, T-1, embed_dim)
+            if detach_targets:
+                target_z = target_z.detach()
+            jepa_loss = (pred_z - target_z).pow(2).mean()
+            loss = loss + jepa_weight * jepa_loss
+            diagnostics["jepa"] = jepa_loss.detach()
+
+        # SIGReg on projected embeddings (LeWM's anti-collapse mechanism)
+        if sigreg_lambda > 0:
+            sig_loss = sigreg(z)
+            loss = loss + sigreg_lambda * sig_loss
+            diagnostics["sigreg"] = sig_loss.detach()
+
+        # CE: lm_head on raw hidden states (separate from JEPA path)
+        if ce_weight > 0:
+            logits = self.lm_head(h)
+            ce_loss = F.cross_entropy(logits.reshape(-1, 256),
+                                      target_ids.reshape(-1))
+            loss = loss + ce_weight * ce_loss
+            diagnostics["ce"] = ce_loss.detach()
+
+        return loss, diagnostics
+
+
+# ---------------------------------------------------------------------------
+# Muon optimizer (Newton-Schulz orthogonalized momentum)
+# ---------------------------------------------------------------------------
+def _ns_orth(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    X /= X.norm() + eps
+    transposed = G.size(0) > G.size(1)
+    if transposed:
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    return X.T if transposed else X
+
+ns_orth = _ns_orth   # will be compiled in main()
+
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr: float, momentum: float,
+                 backend_steps: int, nesterov: bool = True, wd: float = 0.0):
+        super().__init__(params, dict(lr=lr, momentum=momentum,
+                                      backend_steps=backend_steps, nesterov=nesterov, wd=wd))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        distributed = dist.is_available() and dist.is_initialized()
+        world_size = dist.get_world_size() if distributed else 1
+        rank = dist.get_rank() if distributed else 0
+
+        for group in self.param_groups:
+            params = group["params"]
+            if not params:
+                continue
+            lr, mom = group["lr"], group["momentum"]
+            steps, nesterov = group["backend_steps"], group["nesterov"]
+            wd = group.get("wd", 0.0)
+
+            total = sum(p.numel() for p in params)
+            flat = torch.zeros(total, device=params[0].device, dtype=torch.bfloat16)
+            cur = 0
+            for i, p in enumerate(params):
+                if i % world_size == rank and p.grad is not None:
+                    g = p.grad
+                    state = self.state[p]
+                    if "buf" not in state:
+                        state["buf"] = torch.zeros_like(g)
+                    buf = state["buf"]
+                    buf.mul_(mom).add_(g)
+                    if nesterov:
+                        g = g.add(buf, alpha=mom)
+                    g = F.rms_norm(g.float(), (g.size(-1),)).bfloat16()
+                    g = ns_orth(g, steps=steps)
+                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    flat[cur:cur + p.numel()] = g.reshape(-1)
+                cur += p.numel()
+
+            if distributed:
+                dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+
+            cur = 0
+            for p in params:
+                g = flat[cur:cur + p.numel()].view_as(p).to(p.dtype)
+                if wd > 0:
+                    p.mul_(1 - lr * wd)
+                p.add_(g, alpha=-lr)
+                cur += p.numel()
+
+
+# ---------------------------------------------------------------------------
+# Data loading — raw byte shards
+# ---------------------------------------------------------------------------
+def load_byte_shard(path: Path) -> Tensor:
+    """Load a challenge-format shard (header + uint16 values)."""
+    header_bytes = 256 * np.dtype("<i4").itemsize
+    header = np.fromfile(path, dtype="<i4", count=256)
+    if header.size != 256 or int(header[0]) != 20240520:
+        raise ValueError(f"Unexpected shard header for {path}")
+    num_tokens = int(header[2])
+    tokens = np.fromfile(path, dtype="<u2", count=num_tokens, offset=header_bytes)
+    return torch.from_numpy(tokens.astype(np.uint8, copy=False))
+
+
+class ByteStream:
+    def __init__(self, pattern: str):
+        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if not self.files:
+            raise FileNotFoundError(f"No files for pattern: {pattern}")
+        self.file_idx = 0
+        self.data = load_byte_shard(self.files[0])
+        self.pos = 0
+
+    def _advance(self):
+        self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.data = load_byte_shard(self.files[self.file_idx])
+        self.pos = 0
+
+    def take(self, n: int) -> Tensor:
+        chunks = []
+        remaining = n
+        while remaining > 0:
+            avail = self.data.numel() - self.pos
+            if avail <= 0:
+                self._advance()
+                continue
+            k = min(remaining, avail)
+            chunks.append(self.data[self.pos:self.pos + k])
+            self.pos += k
+            remaining -= k
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+
+class DistributedByteLoader:
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+        self.rank, self.world_size, self.device = rank, world_size, device
+        self.stream = ByteStream(pattern)
+
+    def next_batch(self, global_tokens: int, seq_len: int,
+                   grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        per_rank_span = local_tokens + 1
+        chunk = self.stream.take(per_rank_span * self.world_size)
+        start = self.rank * per_rank_span
+        local = chunk[start:start + per_rank_span]
+        local = local.pin_memory().to(self.device, non_blocking=True).to(torch.int64)
+        x = local[:-1].reshape(-1, seq_len)
+        y = local[1:].reshape(-1, seq_len)
+        return x, y
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+def load_val_bytes(pattern: str, seq_len: int,
+                   max_bytes: int = int(os.environ.get("VAL_MAX_TOKENS", 500_000))) -> Tensor:
+    files = sorted(glob.glob(pattern))
+    assert files, f"No files: {pattern}"
+    data = torch.cat([load_byte_shard(Path(p)) for p in files]).contiguous()
+    if max_bytes > 0:
+        data = data[:max_bytes + 1]
+    u = ((data.numel() - 1) // seq_len) * seq_len
+    return data[:u + 1]
+
+
+def eval_val(args, model, rank, world_size, device, grad_accum_steps,
+             val_bytes: Tensor, temperature: float = 1.0):
+    """Evaluate BPB using energy-based scoring."""
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    local_batch_seqs = max(1, local_batch_tokens // args.train_seq_len)
+    total_seqs = (val_bytes.numel() - 1) // args.train_seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_start in range(seq_start, seq_end, local_batch_seqs):
+            batch_end = min(batch_start + local_batch_seqs, seq_end)
+            raw_start = batch_start * args.train_seq_len
+            raw_end = batch_end * args.train_seq_len + 1
+            local = val_bytes[raw_start:raw_end].to(device=device, dtype=torch.int64)
+            x = local[:-1].reshape(-1, args.train_seq_len)
+            y = local[1:].reshape(-1, args.train_seq_len)
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                batch_loss = model(x, y, temperature=temperature).detach()
+
+            n = float(y.numel())
+            loss_sum += batch_loss.to(torch.float64) * n
+            byte_count += n
+
+    if dist.is_available() and dist.is_initialized():
+        for t in (loss_sum, byte_count):
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+    val_loss = loss_sum / byte_count
+    # Each prediction is one byte, so BPB = loss_nats / ln(2)
+    bpb = val_loss.item() / math.log(2.0)
+    model.train()
+    return float(val_loss.item()), float(bpb)
+
+
+def eval_val_sliding(args, model, rank, world_size, device, grad_accum_steps,
+                     val_bytes: Tensor, stride: int = 64, temperature: float = 1.0):
+    """Sliding window evaluation for better BPB."""
+    seq_len = args.train_seq_len
+    batch_size = args.sliding_batch_size
+    total_bytes = val_bytes.numel() - 1
+    all_starts = list(range(0, total_bytes - seq_len, stride))
+    my_starts = all_starts[rank::world_size]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        for i in range(0, len(my_starts), batch_size):
+            batch_starts = my_starts[i:i + batch_size]
+            starts_t = torch.tensor(batch_starts, dtype=torch.int64)
+            offsets = torch.arange(seq_len + 1, dtype=torch.int64)
+            indices = starts_t.unsqueeze(1) + offsets.unsqueeze(0)
+            local_batch = val_bytes[indices].to(device=device, dtype=torch.int64, non_blocking=True)
+            x, y = local_batch[:, :-1], local_batch[:, 1:]
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                per_byte_loss = model(x, y, reduction="none", temperature=temperature).detach()
+
+            for b, start in enumerate(batch_starts):
+                score_from = 0 if start == 0 else seq_len - stride
+                scored = per_byte_loss[b, score_from:]
+                loss_sum += scored.to(torch.float64).sum()
+                byte_count += scored.numel()
+
+    if dist.is_available() and dist.is_initialized():
+        for t in (loss_sum, byte_count):
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+    val_loss = loss_sum / byte_count
+    bpb = val_loss.item() / math.log(2.0)
+    model.train()
+    return float(val_loss.item()), float(bpb)
+
+
+# ---------------------------------------------------------------------------
+# JEPA Diagnostics — verify representation quality independent of BPB
+# ---------------------------------------------------------------------------
+def jepa_diagnostics(model: nn.Module, val_bytes: Tensor, device: torch.device,
+                     seq_len: int = 2048, max_samples: int = 50000):
+    """
+    Check if JEPA is learning in the projected space (LeWM-aligned diagnostics).
+    1. JEPA quality: cosine similarity between pred_proj(predictor(z_t)) and z_{t+1}
+    2. lm_head top-k: is correct byte in top-k from lm_head(h)?
+    3. Linear probe: fresh linear on frozen hidden states h
+    """
+    model.eval()
+    base = model.module if hasattr(model, 'module') else model
+    base = base._orig_mod if hasattr(base, '_orig_mod') else base
+
+    n = min(max_samples + 1, val_bytes.numel())
+    data = val_bytes[:n].to(device=device, dtype=torch.int64)
+    usable = ((data.numel() - 1) // seq_len) * seq_len
+    x = data[:usable].reshape(-1, seq_len)
+    y = data[1:usable + 1].reshape(-1, seq_len)
+    n_seqs = min(x.shape[0], max_samples // seq_len)
+    x, y = x[:n_seqs], y[:n_seqs]
+
+    cos_sims = []
+    jepa_mses = []
+    lm_top1 = lm_top5 = lm_top10 = 0
+    total = 0
+    all_hidden = []
+    all_targets = []
+
+    with torch.no_grad():
+        for i in range(n_seqs):
+            xi, yi = x[i:i+1], y[i:i+1]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                h = base.encode(xi)                           # (1, T, D)
+                z = base.projector(h)                         # (1, T, embed_dim)
+
+                # JEPA prediction quality in projected space
+                pred_z = base.predictor(z[:, :-1, :])         # (1, T-1, embed_dim)
+                pred_z = base.pred_proj(pred_z)               # (1, T-1, embed_dim)
+
+            target_z = z[:, 1:, :]                            # (1, T-1, embed_dim)
+            cos = F.cosine_similarity(pred_z[0].float(), target_z[0].float(), dim=-1)
+            cos_sims.append(cos.mean().item())
+            jepa_mses.append((pred_z - target_z).pow(2).mean().item())
+
+            # lm_head top-k accuracy (on raw hidden states h)
+            h_f = h[0].float()
+            logits = base.lm_head(h_f)                        # (T, 256)
+            targets = yi[0]
+            preds = logits.argsort(dim=-1, descending=True)
+            lm_top1 += (preds[:, :1] == targets.unsqueeze(1)).any(1).sum().item()
+            lm_top5 += (preds[:, :5] == targets.unsqueeze(1)).any(1).sum().item()
+            lm_top10 += (preds[:, :10] == targets.unsqueeze(1)).any(1).sum().item()
+            total += targets.numel()
+
+            if len(all_hidden) * seq_len < 100000:
+                all_hidden.append(h_f.cpu())
+                all_targets.append(targets.cpu())
+
+    # Linear probe on frozen hidden states
+    probe_bpb = float('nan')
+    if all_hidden:
+        H = torch.cat(all_hidden, dim=0)
+        T = torch.cat(all_targets, dim=0)
+        n_train = int(0.8 * H.shape[0])
+        H_tr, H_val = H[:n_train].to(device), H[n_train:].to(device)
+        T_tr, T_val = T[:n_train].to(device), T[n_train:].to(device)
+        probe = nn.Linear(H.shape[-1], 256).to(device)
+        opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
+        bs = min(4096, n_train)
+        for _ in range(200):
+            idx = torch.randint(0, n_train, (bs,), device=device)
+            loss = F.cross_entropy(probe(H_tr[idx]), T_tr[idx])
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.inference_mode():
+            probe_bpb = F.cross_entropy(probe(H_val), T_val).item() / math.log(2.0)
+
+    model.train()
+    return {
+        "jepa_cos_sim": sum(cos_sims) / max(len(cos_sims), 1),
+        "jepa_mse": sum(jepa_mses) / max(len(jepa_mses), 1),
+        "lm_top1": lm_top1 / max(total, 1),
+        "lm_top5": lm_top5 / max(total, 1),
+        "lm_top10": lm_top10 / max(total, 1),
+        "probe_bpb": probe_bpb,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Temperature search (eval-time calibration)
+# ---------------------------------------------------------------------------
+def find_best_temperature(args, model, rank, world_size, device,
+                          grad_accum_steps, val_bytes):
+    best_t, best_loss = 1.0, float("inf")
+    for t in [0.5, 0.7, 0.85, 0.95, 1.0, 1.1, 1.3, 1.5, 2.0]:
+        loss, _ = eval_val(args, model, rank, world_size, device,
+                           grad_accum_steps, val_bytes, temperature=t)
+        if loss < best_loss:
+            best_loss = loss
+            best_t = t
+    return best_t
+
+
+# ---------------------------------------------------------------------------
+# Quantization + Compression Pipeline
+# ---------------------------------------------------------------------------
+# Training-only modules (discarded from artifact — not needed at eval time)
+TRAINING_ONLY = ("predictor.", "projector.", "pred_proj.")
+
+def _is_training_only(name: str) -> bool:
+    return any(name.startswith(p) or f".{p}" in name for p in TRAINING_ONLY)
+
+def _is_large_matrix(name: str, tensor: Tensor, min_numel: int = 4096) -> bool:
+    """Large 2D weight matrices suitable for INT quantization."""
+    return (tensor.ndim == 2 and tensor.numel() >= min_numel
+            and "byte_embed" not in name and "A_log" not in name)
+
+# --- INT-N quantization (per-row absmax, arbitrary bit width) ---
+def quantize_intN(t: Tensor, bits: int = 6) -> tuple[bytes, Tensor, list, int]:
+    """Quantize a 2D tensor to N-bit integers with per-row absmax scaling.
+    Returns (packed_bytes, scales_bf16, original_shape, n_vals)."""
+    t32 = t.float()
+    if t32.ndim < 2:
+        t32 = t32.unsqueeze(0)
+    qmax = (1 << (bits - 1)) - 1  # e.g. 31 for int6, 15 for int5, 7 for int4
+    absmax = t32.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    scale = absmax / qmax
+    q = torch.clamp(torch.round(t32 / scale), -qmax, qmax).to(torch.int16)
+    scale_bf16 = scale.bfloat16().squeeze(-1)
+    # Shift to unsigned for packing
+    flat = (q.reshape(-1) + qmax).numpy().astype(np.uint32)
+    n_vals = len(flat)
+    # Vectorized bit packing
+    total_bits = n_vals * bits
+    total_bytes = (total_bits + 7) // 8
+    packed = np.zeros(total_bytes, dtype=np.uint8)
+    for b in range(bits):
+        # Extract bit b from all values
+        bit_vals = ((flat >> b) & 1).astype(np.uint8)
+        # Compute positions in packed array
+        bit_positions = np.arange(n_vals, dtype=np.uint64) * bits + b
+        byte_indices = (bit_positions >> 3).astype(np.intp)
+        bit_offsets = (bit_positions & 7).astype(np.uint8)
+        np.add.at(packed, byte_indices, bit_vals << bit_offsets)
+    return packed.tobytes(), scale_bf16, list(t.shape), n_vals
+
+def dequantize_intN(packed_bytes: bytes, scale: Tensor, shape: list,
+                    n_vals: int, bits: int = 6) -> Tensor:
+    """Dequantize N-bit packed integers back to float."""
+    qmax = (1 << (bits - 1)) - 1
+    packed = np.frombuffer(packed_bytes, dtype=np.uint8)
+    # Vectorized bit unpacking
+    flat = np.zeros(n_vals, dtype=np.uint16)
+    for b in range(bits):
+        bit_positions = np.arange(n_vals, dtype=np.uint64) * bits + b
+        byte_indices = (bit_positions >> 3).astype(np.intp)
+        bit_offsets = (bit_positions & 7).astype(np.uint8)
+        bit_vals = (packed[byte_indices] >> bit_offsets) & 1
+        flat |= (bit_vals.astype(np.uint16) << b)
+    flat = flat.astype(np.int32) - qmax
+    t = torch.from_numpy(flat.astype(np.float32))
+    if len(shape) >= 2:
+        t = t.reshape(-1, shape[-1])
+        t = t * scale.float().unsqueeze(-1)
+        return t[:shape[0], :shape[-1]].reshape(shape)
+    else:
+        return (t * scale.float()).reshape(shape)
+
+# --- Compression backends ---
+def _compress_lzma(data: bytes) -> bytes:
+    return lzma.compress(data, preset=9)
+
+def _decompress_lzma(data: bytes) -> bytes:
+    return lzma.decompress(data)
+
+def _compress_zstd(data: bytes) -> bytes:
+    import zstandard as zstd
+    return zstd.ZstdCompressor(level=22).compress(data)
+
+def _decompress_zstd(data: bytes) -> bytes:
+    import zstandard as zstd
+    return zstd.ZstdDecompressor().decompress(data)
+
+def _compress_brotli(data: bytes) -> bytes:
+    import brotli
+    return brotli.compress(data, quality=11)
+
+def _decompress_brotli(data: bytes) -> bytes:
+    import brotli
+    return brotli.decompress(data)
+
+COMPRESSORS = {
+    "lzma": (_compress_lzma, _decompress_lzma),
+    "zstd": (_compress_zstd, _decompress_zstd),
+    "brotli": (_compress_brotli, _decompress_brotli),
+}
+
+# --- Full save/load pipeline ---
+def save_model_quantized(model: nn.Module, code: str, path_prefix: str,
+                         bits: int = 6) -> tuple[str, int, int, dict]:
+    """
+    Quantize and compress the model. Tries all available compressors, picks smallest.
+    Strips training-only parameters (predictor, projector, pred_proj).
+
+    Returns: (best_method, model_bytes, code_bytes, stats_dict)
+    """
+    sd = model.state_dict()
+    quantized = {}
+    stats = {"int_params": 0, "int_bytes": 0, "bf16_params": 0, "bf16_bytes": 0, "discarded_params": 0}
+
+    for name, tensor in sd.items():
+        t = tensor.detach().cpu().float().contiguous()
+
+        # Discard training-only modules
+        if _is_training_only(name):
+            stats["discarded_params"] += t.numel()
+            continue
+
+        # Large matrices → INT-N quantization
+        if _is_large_matrix(name, t):
+            packed, scale, shape, n_vals = quantize_intN(t, bits=bits)
+            quantized[name] = {
+                "type": f"int{bits}", "packed": packed, "scale": scale,
+                "shape": shape, "n_vals": n_vals, "bits": bits,
+            }
+            stats["int_params"] += t.numel()
+            stats["int_bytes"] += len(packed) + scale.numel() * 2
+        else:
+            # Everything else → BF16
+            quantized[name] = {"type": "bf16", "data": t.bfloat16()}
+            stats["bf16_params"] += t.numel()
+            stats["bf16_bytes"] += t.numel() * 2
+
+    # Serialize to bytes
+    buf = io.BytesIO()
+    torch.save(quantized, buf)
+    raw_bytes = buf.getvalue()
+
+    # Try all available compressors, pick smallest
+    code_bytes = len(code.encode("utf-8"))
+    results = {}
+    for method, (compress_fn, _) in COMPRESSORS.items():
+        try:
+            compressed = compress_fn(raw_bytes)
+            total = len(compressed) + code_bytes
+            results[method] = (compressed, total)
+        except (ImportError, Exception) as e:
+            pass  # compressor not available
+
+    # Always have lzma as fallback
+    assert results, "No compressor available"
+    best_method = min(results, key=lambda m: results[m][1])
+    best_compressed, best_total = results[best_method]
+
+    # Save best
+    best_path = f"{path_prefix}.{best_method}.ptz"
+    with open(best_path, "wb") as f:
+        f.write(best_compressed)
+
+    # Log all results for comparison
+    stats["compression_results"] = {
+        m: {"compressed_mb": len(c) / 1e6, "total_mb": t / 1e6}
+        for m, (c, t) in results.items()
+    }
+    stats["best_method"] = best_method
+    stats["raw_mb"] = len(raw_bytes) / 1e6
+
+    return best_method, len(best_compressed), code_bytes, stats
+
+
+def load_model_quantized(path: str, model: nn.Module,
+                         device: torch.device) -> nn.Module:
+    """Load quantized + compressed model. Auto-detects compression from extension."""
+    # Detect compression method from filename
+    for method, (_, decompress_fn) in COMPRESSORS.items():
+        if f".{method}." in path:
+            with open(path, "rb") as f:
+                raw = decompress_fn(f.read())
+            break
+    else:
+        # Fallback: try lzma
+        with open(path, "rb") as f:
+            raw = lzma.decompress(f.read())
+
+    quantized = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=False)
+
+    # Dequantize
+    out = {}
+    for name, entry in quantized.items():
+        if entry["type"].startswith("int"):
+            bits = entry["bits"]
+            t = dequantize_intN(entry["packed"], entry["scale"],
+                                entry["shape"], entry["n_vals"], bits)
+            out[name] = t.bfloat16()
+        elif entry["type"] == "bf16":
+            out[name] = entry["data"]
+        else:
+            out[name] = entry["data"]
+
+    model.load_state_dict(out, strict=False)  # strict=False because training-only params are missing
+    return model.to(device)
+
+
+# ---------------------------------------------------------------------------
+# Data preparation utility
+# ---------------------------------------------------------------------------
+def prepare_byte_data(tokenized_dir: str, tokenizer_path: str, output_dir: str,
+                      max_shards: int = 0):
+    """Convert tokenized FineWeb shards to raw byte shards."""
+    import sentencepiece as spm
+    sp = spm.SentencePieceProcessor(model_file=tokenizer_path)
+    os.makedirs(output_dir, exist_ok=True)
+
+    shard_files = sorted(glob.glob(os.path.join(tokenized_dir, "fineweb_*.bin")))
+    if max_shards > 0:
+        # Always include val shards
+        val_shards = [f for f in shard_files if "val" in f]
+        train_shards = [f for f in shard_files if "train" in f][:max_shards]
+        shard_files = val_shards + train_shards
+
+    for shard_file in shard_files:
+        header = np.fromfile(shard_file, dtype="<i4", count=256)
+        if header.size != 256 or int(header[0]) != 20240520:
+            print(f"Skipping {shard_file}: unexpected header")
+            continue
+        num_tokens = int(header[2])
+        header_bytes = 256 * np.dtype("<i4").itemsize
+        tokens = np.fromfile(shard_file, dtype="<u2", count=num_tokens, offset=header_bytes)
+
+        # Decode tokens → text → UTF-8 bytes
+        text = sp.decode(tokens.tolist())
+        raw_bytes = np.frombuffer(text.encode("utf-8"), dtype=np.uint8)
+
+        out_name = os.path.basename(shard_file)
+        out_path = os.path.join(output_dir, out_name)
+        raw_bytes.tofile(out_path)
+        print(f"  {shard_file} → {out_path} ({len(raw_bytes):,} bytes)")
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+SCALAR_PARAM_PATTERNS = ("bias",)
+
+
+def main() -> None:
+    # Handle --prepare-data mode
+    if "--prepare-data" in sys.argv:
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--prepare-data", action="store_true")
+        parser.add_argument("--tokenized-dir", required=True)
+        parser.add_argument("--tokenizer-path", required=True)
+        parser.add_argument("--output-dir", required=True)
+        parser.add_argument("--max-shards", type=int, default=0)
+        pargs = parser.parse_args()
+        prepare_byte_data(pargs.tokenized_dir, pargs.tokenizer_path,
+                          pargs.output_dir, pargs.max_shards)
+        return
+
+    args = Hyperparameters()
+    code = Path(__file__).read_text(encoding="utf-8")
+
+    global ns_orth
+    ns_orth = torch.compile(_ns_orth)
+
+    # --- Distributed setup ---
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    grad_accum_steps = max(1, 8 // world_size)
+    grad_scale = 1.0 / grad_accum_steps
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA required")
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    if distributed:
+        dist.init_process_group(backend="nccl", device_id=device)
+        dist.barrier()
+    master = rank == 0
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    os.makedirs("logs/cuda/", exist_ok=True)
+    logfile = f"logs/cuda/{args.run_id}.txt" if master else None
+
+    def log0(msg: str, console: bool = True):
+        if not master:
+            return
+        if console:
+            print(msg)
+        if logfile:
+            with open(logfile, "a", encoding="utf-8") as f:
+                print(msg, file=f)
+
+    log0(code, console=False)
+    log0("=" * 100, console=False)
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    # --- Validation data ---
+    val_bytes = load_val_bytes(args.val_files, args.train_seq_len)
+
+    # --- Model ---
+    base_model = ByteJEPA(
+        model_dim=args.model_dim,
+        num_layers=args.num_layers,
+        d_state=args.d_state,
+        d_conv=args.d_conv,
+        expand=args.expand,
+        embed_dim=args.embed_dim,
+        predictor_hidden_mult=args.predictor_hidden_mult,
+    ).to(device).float()
+
+    # Auto-scale SIGReg projections if not set
+    effective_embed_dim = args.embed_dim if args.embed_dim > 0 else args.model_dim
+    sigreg_num_proj = args.sigreg_num_proj if args.sigreg_num_proj > 0 else effective_embed_dim * 2
+    sigreg = SIGReg(knots=args.sigreg_knots, num_proj=sigreg_num_proj).to(device)
+
+    torch._dynamo.config.optimize_ddp = False
+    compiled_model = torch.compile(base_model,
+                                   mode=args.compile_mode if args.compile_mode != "default" else None)
+    model = DDP(compiled_model, device_ids=[local_rank],
+                broadcast_buffers=False, gradient_as_bucket_view=True) if distributed else compiled_model
+
+    # --- Optimizers ---
+    matrix_params = [p for n, p in base_model.named_parameters()
+                     if p.ndim == 2 and not any(pat in n for pat in SCALAR_PARAM_PATTERNS)]
+    scalar_params = [p for n, p in base_model.named_parameters()
+                     if p.ndim < 2 or any(pat in n for pat in SCALAR_PARAM_PATTERNS)]
+    embed_params = [base_model.byte_embed.weight]
+    embed_ids = {id(p) for p in embed_params}
+    matrix_params = [p for p in matrix_params if id(p) not in embed_ids]
+
+    opt_muon = Muon(matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum,
+                    backend_steps=args.muon_backend_steps, wd=args.muon_wd)
+    for g in opt_muon.param_groups:
+        g["base_lr"] = args.matrix_lr
+
+    opt_scalar = torch.optim.AdamW(
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2), eps=args.adam_eps,
+        weight_decay=args.adam_wd, fused=True)
+
+    opt_embed = torch.optim.AdamW(
+        [{"params": embed_params, "lr": args.embed_lr, "base_lr": args.embed_lr}],
+        betas=(args.beta1, args.beta2), eps=args.adam_eps,
+        weight_decay=args.adam_wd, fused=True)
+
+    optimizers = [opt_muon, opt_scalar, opt_embed]
+
+    # --- Log config ---
+    n_params = sum(p.numel() for p in base_model.parameters())
+    log0(f"ByteJEPA | params:{n_params:,} layers:{args.num_layers} dim:{args.model_dim} "
+         f"d_state:{args.d_state} expand:{args.expand} | "
+         f"ssm_backend:mamba2_cuda "
+         f"ws:{world_size} ga:{grad_accum_steps}")
+    log0(f"JEPA: jepa_weight={args.jepa_weight} sigreg_lambda={args.sigreg_lambda} ce_weight={args.ce_weight} detach_targets={args.detach_targets}")
+
+    # --- Data loader ---
+    train_loader = DistributedByteLoader(args.train_files, rank, world_size, device)
+
+    def zero_grad_all():
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
+
+    max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+
+    def lr_mul(step: int, elapsed_ms: float):
+        """Linear warmup then cosine-like warmdown."""
+        # Warmup phase
+        if args.warmup_steps > 0 and step < args.warmup_steps:
+            return (step + 1) / args.warmup_steps
+        # Warmdown phase
+        if args.warmdown_fraction <= 0:
+            return 1.0
+        if max_wallclock_ms is None:
+            wd_start = int(args.iterations * (1.0 - args.warmdown_fraction))
+            if step < wd_start:
+                return 1.0
+            return max((args.iterations - step) / max(args.iterations * args.warmdown_fraction, 1), 0.0)
+        wd_ms = max_wallclock_ms * args.warmdown_fraction
+        remaining = max(max_wallclock_ms - elapsed_ms, 0.0)
+        return remaining / max(wd_ms, 1e-9) if remaining <= wd_ms else 1.0
+
+    # --- Main training loop ---
+    training_time_ms = 0.0
+    stop_after_step: int | None = None
+    train_loss = torch.zeros((), device=device)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    step = 0
+
+    while True:
+        last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
+
+        # Validation
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            torch.cuda.synchronize()
+            training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            val_loss, val_bpb = eval_val(args, model, rank, world_size, device,
+                                         grad_accum_steps, val_bytes)
+            log0(f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                 f"train_time:{training_time_ms:.0f}ms")
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        if last_step:
+            break
+
+        # LR scheduling
+        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        scale = lr_mul(step, elapsed_ms)
+
+        # Muon momentum warmup
+        if args.muon_momentum_warmup_steps > 0:
+            frac = min(step / args.muon_momentum_warmup_steps, 1.0)
+            for g in opt_muon.param_groups:
+                g["momentum"] = ((1 - frac) * args.muon_momentum_warmup_start
+                                 + frac * args.muon_momentum)
+
+        # Training step
+        zero_grad_all()
+        train_loss.zero_()
+
+        for micro in range(grad_accum_steps):
+            if distributed:
+                model.require_backward_grad_sync = micro == grad_accum_steps - 1
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len,
+                                           grad_accum_steps)
+            torch.compiler.cudagraph_mark_step_begin()
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss, diag = base_model.compute_jepa_loss(
+                    x, y, sigreg, args.sigreg_lambda, args.ce_weight,
+                    args.jepa_weight, args.detach_targets)
+            train_loss.add_(loss.detach())
+            (loss * grad_scale).backward()
+
+        train_loss /= grad_accum_steps
+
+        # Gradient clipping
+        if args.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+
+        # Optimizer step with LR scaling
+        for opt in optimizers:
+            for g in opt.param_groups:
+                g["lr"] = g["base_lr"] * scale
+            opt.step()
+        zero_grad_all()
+
+        step += 1
+        approx_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        step_avg_ms = approx_ms / step
+
+        # Warmup progress
+        if step <= args.warmup_steps:
+            log0(f"warmup:{step}/{args.warmup_steps} lr_scale:{scale:.4f}")
+
+        if args.train_log_every > 0 and step % args.train_log_every == 0:
+            d_str = " ".join(f"{k}:{v.item():.4f}" for k, v in diag.items())
+            log0(f"step:{step}/{args.iterations} loss:{train_loss.item():.4f} "
+                 f"{d_str} t:{approx_ms:.0f}ms step_avg:{step_avg_ms:.1f}ms")
+
+        # Wallclock cap
+        if stop_after_step is None and max_wallclock_ms is not None and step % 10 == 0:
+            reached = approx_ms >= max_wallclock_ms
+            if distributed:
+                cap_t = torch.tensor(int(reached), device=device)
+                dist.all_reduce(cap_t, op=dist.ReduceOp.MAX)
+                reached = bool(cap_t.item())
+            if reached:
+                stop_after_step = step
+
+    # --- Serialization (quantized + compressed, training-only params discarded) ---
+    if master:
+        log0("--- Quantization & Compression ---")
+        # Try the requested bit width and neighbors for comparison
+        bits_to_try = sorted(set([args.quant_bits, 4, 5, 6]))
+        best_overall_path = None
+        best_overall_total = float("inf")
+        best_overall_method = None
+        best_overall_bits = None
+
+        for bits in bits_to_try:
+            method, model_bytes, code_bytes, stats = save_model_quantized(
+                base_model, code, f"final_model_int{bits}", bits=bits)
+            total = model_bytes + code_bytes
+            fits = "FITS" if total <= 16_000_000 else "OVER"
+            log0(f"  INT{bits}+{method}: {model_bytes/1e6:.2f}MB model + {code_bytes/1e6:.3f}MB code = "
+                 f"{total/1e6:.2f}/16.00MB [{fits}] "
+                 f"(int:{stats['int_params']:,} bf16:{stats['bf16_params']:,} "
+                 f"discarded:{stats['discarded_params']:,})")
+            # Log all compressor results
+            for m, r in stats["compression_results"].items():
+                tag = " <-- BEST" if m == method else ""
+                log0(f"    {m}: {r['compressed_mb']:.2f}MB (total {r['total_mb']:.2f}MB){tag}")
+
+            if total < best_overall_total:
+                best_overall_total = total
+                best_overall_path = f"final_model_int{bits}.{method}.ptz"
+                best_overall_method = method
+                best_overall_bits = bits
+
+        log0(f"  Winner: INT{best_overall_bits}+{best_overall_method} "
+             f"({best_overall_total/1e6:.2f}/16.00MB) "
+             f"{'FITS' if best_overall_total <= 16_000_000 else 'OVER'}")
+
+    # --- Roundtrip evaluation ---
+    if distributed:
+        dist.barrier()
+
+    # All ranks load the best model (master determined the best, file is on shared FS)
+    best_path = f"final_model_int{args.quant_bits}.lzma.ptz"  # fallback
+    if master and best_overall_path:
+        best_path = best_overall_path
+    # In distributed, broadcast the path (use the file that exists)
+    import glob as _g
+    candidates = sorted(_g.glob("final_model_int*.ptz"))
+    if candidates:
+        best_path = candidates[0]  # pick first available
+
+    load_model_quantized(best_path, base_model, device)
+    torch._dynamo.reset()
+
+    q_loss, q_bpb = eval_val(args, model, rank, world_size, device,
+                              grad_accum_steps, val_bytes)
+    log0(f"final_roundtrip val_loss:{q_loss:.4f} val_bpb:{q_bpb:.4f}")
+
+    # JEPA representation diagnostics
+    if master:
+        diag = jepa_diagnostics(model, val_bytes, device, seq_len=args.train_seq_len)
+        log0(f"jepa_diagnostics cos_sim:{diag['jepa_cos_sim']:.4f} jepa_mse:{diag['jepa_mse']:.4f} "
+             f"lm_top1:{diag['lm_top1']:.4f} lm_top5:{diag['lm_top5']:.4f} "
+             f"lm_top10:{diag['lm_top10']:.4f} probe_bpb:{diag['probe_bpb']:.4f}")
+
+    # Temperature search
+    if args.temp_scaling:
+        torch.cuda.synchronize()
+        t_temp = time.perf_counter()
+        opt_temp = find_best_temperature(args, base_model, rank, world_size,
+                                         device, grad_accum_steps, val_bytes)
+        torch.cuda.synchronize()
+        log0(f"temp_scaling optimal_T:{opt_temp:.2f} "
+             f"time:{1000.0 * (time.perf_counter() - t_temp):.0f}ms")
+
+        # Re-eval with optimal temperature
+        t_loss, t_bpb = eval_val(args, model, rank, world_size, device,
+                                  grad_accum_steps, val_bytes, temperature=opt_temp)
+        log0(f"final_temped val_loss:{t_loss:.4f} val_bpb:{t_bpb:.4f} T={opt_temp:.2f}")
+
+    # Sliding window eval
+    if args.sliding_eval:
+        torch.cuda.synchronize()
+        t_sw = time.perf_counter()
+        temp = opt_temp if args.temp_scaling else 1.0
+        sw_loss, sw_bpb = eval_val_sliding(args, base_model, rank, world_size,
+                                            device, grad_accum_steps, val_bytes,
+                                            stride=args.sliding_eval_stride,
+                                            temperature=temp)
+        torch.cuda.synchronize()
+        log0(f"final_sliding val_loss:{sw_loss:.4f} val_bpb:{sw_bpb:.4f} "
+             f"(stride={args.sliding_eval_stride}, T={temp:.2f}) "
+             f"time:{1000.0 * (time.perf_counter() - t_sw):.0f}ms")
+
+    if distributed:
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+====================================================================================================
+ByteJEPA | params:23,520,576 layers:12 dim:512 d_state:64 expand:2 | ssm_backend:mamba2_cuda ws:8 ga:1
+JEPA: jepa_weight=1.0 sigreg_lambda=0.01 ce_weight=1.0 detach_targets=False
+step:0/5000 val_loss:5.5139 val_bpb:7.9548 train_time:0ms
+warmup:1/10 lr_scale:0.1000
+warmup:2/10 lr_scale:0.2000
+warmup:3/10 lr_scale:0.3000
+warmup:4/10 lr_scale:0.4000
+warmup:5/10 lr_scale:0.5000
+warmup:6/10 lr_scale:0.6000
+warmup:7/10 lr_scale:0.7000
+warmup:8/10 lr_scale:0.8000
+warmup:9/10 lr_scale:0.9000
+warmup:10/10 lr_scale:1.0000
+step:100/5000 loss:4.4752 jepa:0.6077 sigreg:206.0000 ce:1.8051 t:28305ms step_avg:283.0ms
+step:200/5000 loss:3.3266 jepa:0.4121 sigreg:140.0000 ce:1.5161 t:41587ms step_avg:207.9ms
+step:300/5000 loss:3.2860 jepa:0.3685 sigreg:131.0000 ce:1.6050 t:54871ms step_avg:182.9ms
+step:400/5000 loss:2.9154 jepa:0.3332 sigreg:113.0000 ce:1.4494 t:68157ms step_avg:170.4ms
+step:500/5000 loss:2.8516 jepa:0.3379 sigreg:108.5000 ce:1.4278 t:81630ms step_avg:163.3ms
+step:500/5000 val_loss:1.4852 val_bpb:2.1427 train_time:81682ms
+step:600/5000 loss:2.8127 jepa:0.3363 sigreg:96.5000 ce:1.5115 t:94920ms step_avg:158.2ms
+step:700/5000 loss:2.6937 jepa:0.3090 sigreg:88.0000 ce:1.5059 t:108210ms step_avg:154.6ms
+step:800/5000 loss:2.5665 jepa:0.2835 sigreg:82.5000 ce:1.4588 t:121502ms step_avg:151.9ms
+step:900/5000 loss:2.4268 jepa:0.2516 sigreg:81.5000 ce:1.3588 t:134791ms step_avg:149.8ms
+step:1000/5000 loss:2.4665 jepa:0.2378 sigreg:82.5000 ce:1.4044 t:148278ms step_avg:148.3ms
+step:1000/5000 val_loss:1.4024 val_bpb:2.0232 train_time:148329ms
+step:1100/5000 loss:2.5119 jepa:0.2277 sigreg:80.0000 ce:1.4834 t:161570ms step_avg:146.9ms
+step:1200/5000 loss:2.3258 jepa:0.2089 sigreg:73.5000 ce:1.3825 t:174858ms step_avg:145.7ms
+step:1300/5000 loss:2.2268 jepa:0.1951 sigreg:66.5000 ce:1.3676 t:188155ms step_avg:144.7ms
+step:1400/5000 loss:2.2911 jepa:0.1879 sigreg:66.0000 ce:1.4431 t:201727ms step_avg:144.1ms
+step:1500/5000 loss:2.2664 jepa:0.1812 sigreg:67.5000 ce:1.4095 t:214986ms step_avg:143.3ms
+step:1500/5000 val_loss:1.3631 val_bpb:1.9666 train_time:215037ms
+step:1600/5000 loss:2.2067 jepa:0.1707 sigreg:64.5000 ce:1.3915 t:228245ms step_avg:142.7ms
+step:1700/5000 loss:2.0445 jepa:0.1595 sigreg:61.0000 ce:1.2757 t:241505ms step_avg:142.1ms
+step:1800/5000 loss:2.1919 jepa:0.1658 sigreg:60.5000 ce:1.4206 t:254766ms step_avg:141.5ms
+step:1900/5000 loss:2.2331 jepa:0.1616 sigreg:66.0000 ce:1.4114 t:268212ms step_avg:141.2ms
+step:2000/5000 loss:2.0271 jepa:0.1461 sigreg:62.7500 ce:1.2521 t:281470ms step_avg:140.7ms
+step:2000/5000 val_loss:1.3442 val_bpb:1.9392 train_time:281521ms
+step:2100/5000 loss:2.1921 jepa:0.1505 sigreg:65.5000 ce:1.3853 t:294726ms step_avg:140.3ms
+step:2200/5000 loss:2.0093 jepa:0.1403 sigreg:57.5000 ce:1.2948 t:307987ms step_avg:140.0ms
+step:2300/5000 loss:2.0343 jepa:0.1396 sigreg:57.7500 ce:1.3166 t:321244ms step_avg:139.7ms
+step:2400/5000 loss:2.2693 jepa:0.1445 sigreg:66.5000 ce:1.4608 t:334691ms step_avg:139.5ms
+step:2500/5000 loss:2.0240 jepa:0.1322 sigreg:54.5000 ce:1.3449 t:347956ms step_avg:139.2ms
+step:2500/5000 val_loss:1.3258 val_bpb:1.9127 train_time:348008ms
+step:2600/5000 loss:1.9667 jepa:0.1279 sigreg:53.5000 ce:1.3036 t:361219ms step_avg:138.9ms
+step:2700/5000 loss:2.0095 jepa:0.1227 sigreg:58.5000 ce:1.3008 t:374479ms step_avg:138.7ms
+step:2800/5000 loss:1.9966 jepa:0.1233 sigreg:56.7500 ce:1.3069 t:387926ms step_avg:138.5ms
+step:2900/5000 loss:1.9170 jepa:0.1166 sigreg:53.0000 ce:1.2692 t:401186ms step_avg:138.3ms
+step:3000/5000 loss:1.9873 jepa:0.1172 sigreg:52.7500 ce:1.3427 t:414442ms step_avg:138.1ms
+step:3000/5000 val_loss:1.3083 val_bpb:1.8875 train_time:414494ms
+step:3100/5000 loss:1.8527 jepa:0.1093 sigreg:49.2500 ce:1.2513 t:427703ms step_avg:138.0ms
+step:3200/5000 loss:1.9494 jepa:0.1104 sigreg:53.5000 ce:1.3039 t:440959ms step_avg:137.8ms
+step:3300/5000 loss:1.8268 jepa:0.1049 sigreg:48.2500 ce:1.2395 t:454410ms step_avg:137.7ms
+step:3400/5000 loss:1.8954 jepa:0.1052 sigreg:49.2500 ce:1.2980 t:467667ms step_avg:137.5ms
+step:3500/5000 loss:1.8953 jepa:0.1026 sigreg:49.7500 ce:1.2947 t:480929ms step_avg:137.4ms
+step:3500/5000 val_loss:1.2986 val_bpb:1.8735 train_time:480981ms
+step:3600/5000 loss:1.8836 jepa:0.0992 sigreg:48.0000 ce:1.3039 t:494188ms step_avg:137.3ms
+step:3700/5000 loss:1.7931 jepa:0.0971 sigreg:45.7500 ce:1.2390 t:507445ms step_avg:137.1ms
+step:3800/5000 loss:2.0745 jepa:0.1045 sigreg:53.2500 ce:1.4388 t:520903ms step_avg:137.1ms
+step:3900/5000 loss:1.7969 jepa:0.0852 sigreg:42.7500 ce:1.2840 t:534160ms step_avg:137.0ms
+step:4000/5000 loss:1.7778 jepa:0.0769 sigreg:44.0000 ce:1.2614 t:547421ms step_avg:136.9ms
+step:4000/5000 val_loss:1.2602 val_bpb:1.8181 train_time:547472ms
+step:4100/5000 loss:1.6101 jepa:0.0670 sigreg:33.5000 ce:1.2072 t:560677ms step_avg:136.8ms
+step:4200/5000 loss:1.6360 jepa:0.0644 sigreg:32.2500 ce:1.2493 t:574135ms step_avg:136.7ms
+step:4300/5000 loss:1.6198 jepa:0.0587 sigreg:33.0000 ce:1.2310 t:587392ms step_avg:136.6ms
+step:4390/5000 val_loss:1.2166 val_bpb:1.7552 train_time:599376ms
+--- Quantization & Compression ---
+  INT4+brotli: 8.10MB model + 0.052MB code = 8.16/16.00MB [FITS] (int:20,152,320 bf16:213,824 discarded:3,154,432)
+    lzma: 8.22MB (total 8.28MB)
+    zstd: 9.17MB (total 9.22MB)
+    brotli: 8.10MB (total 8.16MB) <-- BEST
+  INT5+brotli: 12.67MB model + 0.052MB code = 12.72/16.00MB [FITS] (int:20,152,320 bf16:213,824 discarded:3,154,432)
+    lzma: 12.73MB (total 12.78MB)
+    zstd: 13.54MB (total 13.59MB)
+    brotli: 12.67MB (total 12.72MB) <-- BEST
+  INT6+brotli: 14.85MB model + 0.052MB code = 14.90/16.00MB [FITS] (int:20,152,320 bf16:213,824 discarded:3,154,432)
+    lzma: 14.91MB (total 14.96MB)
+    zstd: 16.08MB (total 16.13MB)
+    brotli: 14.85MB (total 14.90MB) <-- BEST
+  Winner: INT4+brotli (8.16/16.00MB) FITS
+final_roundtrip val_loss:1.2582 val_bpb:1.8153
+jepa_diagnostics cos_sim:0.9654 jepa_mse:0.0597 lm_top1:0.6127 lm_top5:0.8739 lm_top10:0.9381 probe_bpb:2.0848
+temp_scaling optimal_T:1.00 time:48746ms
+final_temped val_loss:1.2582 val_bpb:1.8153 T=1.00
