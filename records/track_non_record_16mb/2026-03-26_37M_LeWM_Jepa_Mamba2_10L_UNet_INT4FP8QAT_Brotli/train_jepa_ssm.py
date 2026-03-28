@@ -895,17 +895,20 @@ def save_checkpoint(checkpoint_dir: str, step: int, base_model: nn.Module,
         "optimizers": [o.state_dict() for o in optimizers],
         "rng_cpu": torch.get_rng_state(),
         "rng_cuda": torch.cuda.get_rng_state(),
+        "sigreg": sigreg.state_dict(),
     }
     tmp = path + ".tmp"
     torch.save(payload, tmp)
     os.replace(tmp, path)   # atomic on POSIX
 
 def load_checkpoint(path: str, base_model: nn.Module, optimizers: list,
-                    device: torch.device) -> tuple[int, float]:
+                    device: torch.device, sigreg: nn.Module | None = None) -> tuple[int, float]:
     payload = torch.load(path, map_location=device, weights_only=False)
     base_model.load_state_dict(payload["model"], strict=True)
     for opt, sd in zip(optimizers, payload["optimizers"]):
         opt.load_state_dict(sd)
+    if sigreg is not None and "sigreg" in payload:
+        sigreg.load_state_dict(payload["sigreg"])
     torch.set_rng_state(payload["rng_cpu"].cpu())
     torch.cuda.set_rng_state(payload["rng_cuda"].cpu())
     return payload["step"], payload["training_time_ms"]
@@ -1321,7 +1324,7 @@ def main() -> None:
         if ckpt is not None:
             log0(f"checkpoint found: {ckpt}")
             _resume_step, _resume_training_ms = load_checkpoint(
-                ckpt, base_model, optimizers, device)
+                ckpt, base_model, optimizers, device, sigreg=sigreg)
             log0(f"checkpoint loaded, starting from step {_resume_step} "
                  f"(accumulated_train_time:{_resume_training_ms:.0f}ms)")
         else:
